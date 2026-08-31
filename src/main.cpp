@@ -428,7 +428,7 @@ struct Col {
 struct View {
     Display* dpy = nullptr;
     int screen = 0, rootW = 0, rootH = 0;
-    Window win = None;
+    Window root = None, win = None;
     cairo_surface_t* surf = nullptr;
     Visual* visual = nullptr;
     bool argb = false;
@@ -629,7 +629,78 @@ static void setEwmhHints(View& v) {
     XChangeProperty(d, v.win, gfe, XA_CARDINAL, 32, PropModeReplace,
                     (unsigned char*)ext, 4);
 
+    // ask to stay above regular windows (compositor/WMs may honor this)
+    Atom a_state = XInternAtom(d, "_NET_WM_STATE", False);
+    Atom a_above = XInternAtom(d, "_NET_WM_STATE_ABOVE", False);
+    XChangeProperty(d, v.win, a_state, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char*)&a_above, 1);
+
     XStoreName(d, v.win, "jtop");
+}
+
+struct OutRect { int x, y, w, h; bool primary; };
+
+// Ask the `xrandr` CLI for connected outputs (avoids linking libXrandr).
+// On Mutter/GNOME X11 all monitors form ONE merged root window, so "bottom
+// right of the root" can land on a monitor the user isn't even looking at.
+static std::vector<OutRect> monitorRects() {
+    static const char* kCmd = "xrandr -q 2>/dev/null";
+    std::vector<OutRect> out;
+    FILE* f = popen(kCmd, "r");
+    if (!f) return out; // xrandr missing -> caller falls back to whole root
+    char buf[512];
+    std::string line;
+    while (fgets(buf, sizeof buf, f)) {
+        line = buf;
+        if (line.empty() || !isalpha((unsigned char)line[0])) continue;
+        size_t p = line.find(" connected"); // "disconnected" has no leading space
+        if (p == std::string::npos) continue;
+        const char* tok = line.c_str() + p + 10; // skip past " connected"
+        while (*tok == ' ') ++tok;
+        OutRect r{0, 0, 0, 0, false};
+        if (!std::strncmp(tok, "primary ", 8)) { r.primary = true; tok += 8; }
+        int x = 0, y = 0, w = 0, h = 0;
+        // geometry token looks like 6144x3456+0+1874 (rotation already accounted for)
+        if (std::sscanf(tok, "%dx%d+%d+%d", &w, &h, &x, &y) == 4) {
+            r.w = w; r.h = h; r.x = x; r.y = y;
+            out.push_back(r);
+        }
+    }
+    pclose(f);
+    return out;
+}
+
+// Move the (still unmapped) widget to the bottom-right of the monitor that
+// currently holds the pointer, i.e. where the user ran the app and is looking.
+static void placeBottomRight(View& v) {
+    const int margin = 24;
+    auto rects = monitorRects();
+
+    const OutRect* mon = nullptr;
+    if (!rects.empty()) {
+        Window rootRet = None, childRet = None;
+        int xr = 0, yr = 0, xd = 0, yd = 0; unsigned mask = 0;
+        XQueryPointer(v.dpy, v.root, &rootRet, &childRet, &xr, &yr, &xd, &yd, &mask);
+        int px = xr, py = yr;
+        for (auto& r : rects)
+            if (px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h) { mon = &r; break; }
+        if (!mon)
+            for (auto& r : rects) if (r.primary) { mon = &r; break; } // no pointer match -> primary
+        if (!mon) mon = &rects[0];
+    }
+
+    int x, y;
+    if (mon) {
+        x = mon->x + mon->w - v.winW - margin; // bottom-right corner of that monitor
+        y = mon->y + mon->h - v.winH - margin;
+        // clamp: keep it on the monitor even if the widget is wider than it
+        x = std::max(mon->x, std::min(x, mon->x + mon->w - v.winW));
+        y = std::max(mon->y, std::min(y, mon->y + mon->h - v.winH));
+    } else {
+        x = v.rootW - v.winW - margin;
+        y = v.rootH - v.winH - margin;
+    }
+    XMoveWindow(v.dpy, v.win, x, y);
 }
 
 static int createWindow(View& v) {
@@ -640,6 +711,7 @@ static int createWindow(View& v) {
     }
     v.dpy = dpy;
     v.screen = DefaultScreen(dpy);
+    v.root = RootWindow(dpy, v.screen);
     v.rootW = DisplayWidth(dpy, v.screen);
     v.rootH = DisplayHeight(dpy, v.screen);
 
@@ -799,7 +871,8 @@ int main(int argc, char** argv) {
     State s{};
     refresh(s);      // initial snapshot (includes a quick CPU baseline sample)
     render(v, s.snap);
-    XMapWindow(v.dpy, v.win); // paint first, map second -> no background flash
+    placeBottomRight(v);          // land on the monitor the user is looking at
+    XMapWindow(v.dpy, v.win);     // paint first, map second -> no background flash
 
     runEventLoop(v, s);
 
