@@ -61,9 +61,22 @@ cmake --build build
 No CMake? One-liner also works:
 
 ```sh
-g++ -O2 src/main.cpp -o jtop $(pkg-config --cflags --libs x11 cairo)
+g++ -O2 src/main.cpp src/system.cc src/terminal.cc src/gui.cc \
+    -o jtop $(pkg-config --cflags --libs x11 cairo)
 ./jtop
 ```
+
+## Source layout
+
+| File                  | Role |
+|-----------------------|------|
+| `src/main.cpp`        | argument parsing + mode dispatch (`--dump`, `--table`, widget, no-display fallback) |
+| `src/system.{h,cc}`   | all `/proc`, sysfs and nvidia-smi/rocm-smi reads that produce the `Snapshot`; no X11 or output code |
+| `src/terminal.{h,cc}` | text presentation: the `--dump` snapshot and the live table view (also the fallback) |
+| `src/gui.{h,cc}`      | the X11 widget: windows, DPI scale detection, cairo painting of the row + GPU hover popup, event loop |
+
+`test/render_test.cc` links against the `system` + `gui` modules directly and
+re-renders a fake snapshot headlessly (`widget_test.png`).
 
 ## Test without a display (headless CI/container)
 

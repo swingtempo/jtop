@@ -1,15 +1,21 @@
-// Headless render test: includes the app source (renaming its main) and paints
-// a fake snapshot that mimics the reference image onto a checkerboard "desktop"
-// so alpha/rounded corners are visible. Also renders the GPU hover popup below
-// the first GPU column. Output: widget_test.png in cwd.
+// Headless render test: links against the app's modules (gui.h exposes the
+// layout/paint API) and paints a fake snapshot that mimics the reference image
+// onto a checkerboard "desktop" so alpha/rounded corners are visible. Also
+// renders the GPU hover popup below the first GPU column.
+// Output: widget_test.png in cwd.
 //
 // Build with CMake (target: jtop_render_test), or manually:
-//   g++ -O2 -o build/jtop_render_test test/render_test.cc $(pkg-config --cflags --libs cairo x11)
+//   g++ -O2 -o build/jtop_render_test test/render_test.cc src/gui.cc src/system.cc $(pkg-config --cflags --libs cairo x11)
 //   ./build/jtop_render_test
 
-#define main jtop_app_main // rename the app's entry point while including it...
-#include "../src/main.cpp" // statics become visible to this translation unit
-#undef main                // ...and restore it for our own test entry below
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "../src/gui.h"
+#include "../src/system.h"
 
 int main() {
     Snapshot s;
