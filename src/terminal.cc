@@ -48,6 +48,8 @@ void printDump(const Snapshot& s) {
             m += gp.name.empty() ? "--" : gp.name;
             if (!gp.pciAddr.empty()) m += "  pci " + gp.pciAddr;
             if (!gp.pciIds.empty())  m += " (" + gp.pciIds + ")";
+            const std::string pcie = pcieLabel(gp);
+            if (!pcie.empty())       m += "  pcie " + pcie;
             printf("      %s\n", m.c_str());
         }
         for (const auto& cn : gp.conns) connDetail(cn);
@@ -75,8 +77,8 @@ struct TCol { const char* title; bool right = false; };
 
 static void printGpuTable(const Snapshot& s, bool showConns) {
     static const TCol kCols[] = {
-        {"#", true},   {"DEVICE"},   {"PCI"},       {"UTIL", true},
-        {"VRAM", true},{"TEMP", true},{"CONN"},
+        {"#", true},  {"DEVICE"},   {"PCI"},      {"PCIE"},
+        {"UTIL", true},{"VRAM", true},{"TEMP", true},{"CONN"},
     };
     constexpr size_t NC = sizeof(kCols) / sizeof(kCols[0]);
 
@@ -89,6 +91,10 @@ static void printGpuTable(const Snapshot& s, bool showConns) {
         std::string pci = gp.pciAddr.empty() ? "--" : gp.pciAddr;
         if (!gp.pciIds.empty()) pci += (" [" + gp.pciIds + "]");
 
+        // PCIe link speed/width, e.g. "Gen4 x16"; "-" when the kernel doesn't report it
+        std::string pcie = pcieLabel(gp);
+        if (pcie.empty()) pcie = "-";
+
         // CONN summarizes the connection list as connected/total without
         // printing one line per connector (toggle those with 'c')
         size_t on = 0;
@@ -99,6 +105,7 @@ static void printGpuTable(const Snapshot& s, bool showConns) {
         rows.push_back({std::to_string(i),
                         gp.name.empty() ? "--" : gp.name,
                         pci,
+                        pcie,
                         (gp.util < 0) ? "--" : (std::to_string(gp.util) + "%"),
                         fmtMiB(gp.vramUsedMiB) + " / " + fmtMiB(gp.vramTotalMiB),
                         (gp.tempC < 0) ? "--" : (std::to_string(gp.tempC) + "\xC2\xB0"),

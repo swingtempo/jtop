@@ -630,6 +630,9 @@ void popupRows(const GpuInfo& g, std::vector<PopRow>& rows) {
         rows.push_back({t, 1});
     }
 
+    const std::string pcie = pcieLabel(g); // e.g. "Gen4 x16"
+    if (!pcie.empty()) rows.push_back({"PCIe " + pcie, 1});
+
     if (g.conns.empty()) {
         rows.push_back({"no display connections", 3});
         return;

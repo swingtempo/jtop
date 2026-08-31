@@ -151,6 +151,16 @@ std::string fmtMiB(long mib) {
     return b;
 }
 
+// compact PCIe link description: "Gen4 x16"; running below the max supported
+// generation is shown as "Gen3/4 x16". Empty when unknown.
+std::string pcieLabel(const GpuInfo& g) {
+    if (g.pcieGen < 0) return "";
+    std::string s = "Gen" + std::to_string(g.pcieGen);
+    if (g.pcieMaxGen > g.pcieGen) s += "/" + std::to_string(g.pcieMaxGen); // downgraded link
+    if (g.pcieWidth > 0)          s += " x" + std::to_string(g.pcieWidth);
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // CPU temperature via sysfs hwmon / thermal zones
 // ---------------------------------------------------------------------------
@@ -325,7 +335,37 @@ struct DrmCard {
     std::string label;     // device/label (amdgpu/intel expose it) or ""
     std::string vendorDev; // PCI IDs, e.g. "10de:2684", or ""
     std::vector<GpuConn> conns;
+    int pcieGen = -1, pcieMaxGen = -1, pcieWidth = -1; // PCIe link state, or -1
 };
+
+// per-lane speed -> PCIe generation from the spec table: Gen1..Gen6 =
+// 2.5 / 5 / 8 / 16 / 32 / 64 GT/s (half a step of tolerance covers rounding)
+static int gtToGen(double gts) {
+    static const double kGt[6] = {2.5, 5.0, 8.0, 16.0, 32.0, 64.0};
+    for (int gen = 0; gen < 6; ++gen)
+        if (std::abs(gts - kGt[gen]) < 0.5) return gen + 1;
+    return -1;
+}
+
+// PCIe link state of one PCI device, from the kernel's own reporting:
+//   current_link_speed: "32.0 GT/s PCIe", sometimes with the max supported
+//                       value appended like "8.0 GT/s cap 16.0 GT/s"
+//   current_link_width: a plain lane count ("16")
+// Non-PCIe devices don't expose these files at all -> fields stay -1.
+static void readPcieLink(const std::string& devPath, DrmCard& c) {
+    const std::string spd = trim(readFile(devPath + "/current_link_speed", 64));
+    if (!spd.empty() && spd.find("GT/s") != std::string::npos) {
+        c.pcieGen = gtToGen(strtod(spd.c_str(), nullptr));
+        size_t capPos = spd.find("cap ");
+        if (capPos != std::string::npos) { // "... GT/s cap 16.0 GT/s"
+            const char* p2 = spd.c_str() + capPos + 4;
+            while (*p2 && !isdigit((unsigned char)*p2)) ++p2; // skip to the number
+            c.pcieMaxGen = gtToGen(strtod(p2, nullptr));
+        }
+    }
+    long w = readLong(devPath + "/current_link_width");
+    if (w >= 1 && w <= 64) c.pcieWidth = (int)w;
+}
 
 static std::vector<DrmCard> readDrmCards() {
     struct Pending { int n; GpuConn c; }; // connectors seen before their card entry
@@ -378,6 +418,7 @@ static std::vector<DrmCard> readDrmCards() {
             std::string vid = hexId(readFile(rp + "/vendor", 64));
             std::string did = hexId(readFile(rp + "/device", 64));
             if (!vid.empty() && !did.empty()) c.vendorDev = vid + ":" + did;
+            readPcieLink(rp, c);
         }
         c.label = trim(readFile(dev + "/label", 256)); // amdgpu/intel; often absent
     }
@@ -393,6 +434,10 @@ static void attachMeta(GpuInfo& g, const DrmCard* c) {
     if (g.pciAddr.empty())                    g.pciAddr = c->pciAddr;
     if (g.pciIds.empty())                     g.pciIds = c->vendorDev;
     g.conns = c->conns;
+    // PCIe link state only comes from sysfs (works for every vendor)
+    if (g.pcieGen < 0)      g.pcieGen    = c->pcieGen;
+    if (g.pcieMaxGen < 0)   g.pcieMaxGen = c->pcieMaxGen;
+    if (g.pcieWidth < 0)    g.pcieWidth  = c->pcieWidth;
 }
 
 static std::vector<GpuInfo> sysfsGpus(const std::vector<DrmCard>& cards) {
