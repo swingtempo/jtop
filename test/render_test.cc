@@ -32,7 +32,7 @@ int main() {
     g0.name = "NVIDIA GeForce RTX 3090";
     g0.pciAddr = "0000:65:00.0";
     g0.pciIds = "10de:2280";
-    g0.pcieGen = 4; g0.pcieMaxGen = 4; g0.pcieWidth = 16; // "Gen4 x16" (a real 3090 in a Gen4 slot)
+    g0.pcieGen = 4; g0.pcieMaxGen = 5; g0.pcieWidth = 16; // "Gen4 x16": card capable of Gen5, slot negotiates Gen4
     g0.conns.push_back({"DP-1",     "DisplayPort", true,  "3840x2160@60Hz"});
     g0.conns.push_back({"HDMI-A-1", "HDMI",        false, ""});
 

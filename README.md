@@ -25,13 +25,18 @@ the widget; right-click quits it. It sits in the top-right corner as a
 borderless always-on-top "dock" window (no taskbar entry).
 
 Hovering over any GPU or VRAM column pops up a small card with the device's
-name, PCI address/IDs, PCIe link speed (`PCIe Gen4 x16`, shown as `Gen3/4`
-when running below the max supported generation) and its display connections
+name, PCI address/IDs, PCIe link speed (`PCIe Gen4 x16` — the actually
+negotiated link, not the card's max capability) and its display connections
 (`DP-1 DisplayPort`, `HDMI-A-2 HDMI`, ...) including resolution when
 connected; moving away hides it. Connections come from `/sys/class/drm` on
 every vendor path (NVIDIA needs `nvidia-drm.modeset=1` for that; a headless
-card shows none); the PCIe state comes from the PCI device's sysfs files, so
-it works regardless of which GPU stats source is active.
+card shows none). The PCIe state is the **real negotiated link**: amdgpu's
+`current_link_speed`/`current_link_width` sysfs files wrongly report the GPU's
+max capability (a Gen4-slot card shows 32.0 GT/s / x16 there), so on AMD the
+driver's `pp_dpm_pcie` DPM table (active state marked with `*`) is used
+instead; other vendors use the PCI sysfs files directly. A runtime-suspended
+GPU (e.g. no display attached) can't report its link — the popup/table then
+show `-` rather than a wrong speed.
 
 ## GPU support
 
@@ -124,23 +129,23 @@ tty is restored either way). When stdout is piped or redirected it prints one
 compact table and exits — handy for logs/tickets/CI; use `--dump` there if you
 want the full machine-readable snapshot incl. per-connector details.
 
-Default view:
+Default view (second card runs at Gen3 x4 — a downgraded slot):
 
 ```
 CPU 3%   RAM 27.8G   SWAP 1.4G   CPU° 35
 #  DEVICE  PCI                       PCIE      UTIL           VRAM  TEMP  CONN
 -  ------  ------------------------  --------  ----  -------------  ----  ----
-0  --      0000:0b:00.0 [1002:7551]  Gen4 x16    0%    57M / 31.9G   32°  0/4
-1  --      0000:06:00.0 [1002:7551]  Gen4 x16    8%  29.5G / 31.9G   70°  2/4
+0  --      0000:0b:00.0 [1002:7551]  Gen4 x16   0%    57M / 31.9G   32°  0/4
+1  --      0000:06:00.0 [1002:7551]  Gen3 x4    8%  29.5G / 31.9G   70°  2/4
 ```
 
 With connection details shown (after pressing **c**):
 
 ```
-0  --      0000:0b:00.0 [1002:7551]  Gen4 x16    0%    57M / 31.9G   32°  0/4
+0  --      0000:0b:00.0 [1002:7551]  Gen4 x16   0%    57M / 31.9G   32°  0/4
       DP-4       DisplayPort  off
       ...                                            
-1  --      0000:06:00.0 [1002:7551]  Gen4 x16    8%  29.5G / 31.9G   70°  2/4
+1  --      0000:06:00.0 [1002:7551]  Gen3 x4    8%  29.5G / 31.9G   70°  2/4
       DP-2       DisplayPort  connected  3840x2160
 ```
 

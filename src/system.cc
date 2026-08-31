@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <sstream>
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
@@ -151,13 +152,12 @@ std::string fmtMiB(long mib) {
     return b;
 }
 
-// compact PCIe link description: "Gen4 x16"; running below the max supported
-// generation is shown as "Gen3/4 x16". Empty when unknown.
+// compact PCIe link description: "Gen4 x16" (the actually negotiated link).
+// Empty when unknown.
 std::string pcieLabel(const GpuInfo& g) {
     if (g.pcieGen < 0) return "";
     std::string s = "Gen" + std::to_string(g.pcieGen);
-    if (g.pcieMaxGen > g.pcieGen) s += "/" + std::to_string(g.pcieMaxGen); // downgraded link
-    if (g.pcieWidth > 0)          s += " x" + std::to_string(g.pcieWidth);
+    if (g.pcieWidth > 0) s += " x" + std::to_string(g.pcieWidth);
     return s;
 }
 
@@ -347,20 +347,77 @@ static int gtToGen(double gts) {
     return -1;
 }
 
-// PCIe link state of one PCI device, from the kernel's own reporting:
-//   current_link_speed: "32.0 GT/s PCIe", sometimes with the max supported
-//                       value appended like "8.0 GT/s cap 16.0 GT/s"
-//   current_link_width: a plain lane count ("16")
-// Non-PCIe devices don't expose these files at all -> fields stay -1.
+// Parse amdgpu's pp_dpm_pcie DPM table and fill the card with the link state
+// the driver actually negotiated. The generic PCI sysfs files (current_link_
+// speed/width) report the link's MAX capability on amdgpu (a long-standing
+// kernel quirk: e.g. a Gen4 board shows "32.0 GT/s" / "x16" even though the
+// card really runs at Gen4 x16) - amdgpu_top reads this file for the same
+// reason. Each line is a driver link state, the '*' marks the currently
+// active one(s):
+//     "1: 16.0GT/s, x16 1143Mhz *"   -> Gen4 x16
+// Returns true when an active state was found. Non-amdgpu devices don't have
+// this file at all (readFile returns "").
+static bool readAmdPcie(const std::string& devPath, DrmCard& c) {
+    const std::string txt = trim(readFile(devPath + "/pp_dpm_pcie", 1024));
+    if (txt.empty()) return false;
+    double bestGts = -1; int bestW = -1;
+    std::istringstream in(txt);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find('*') == std::string::npos) continue; // not the active state
+        size_t col = line.find(':');
+        if (col == std::string::npos) continue;
+        double gts = strtod(line.c_str() + col + 1, nullptr); // "1: 16.0GT/s, ..."
+        if (gts <= 0) continue;
+        if (gts > bestGts) { // several active states: take the fastest one
+            bestGts = gts;
+            bestW = -1;
+            size_t x = line.find(", x");
+            if (x != std::string::npos) bestW = atoi(line.c_str() + x + 3);
+        }
+    }
+    if (bestGts <= 0) return false;
+    c.pcieGen = gtToGen(bestGts);
+    if (bestW >= 1 && bestW <= 64) c.pcieWidth = bestW;
+    return true;
+}
+
+// PCIe link state of one PCI device:
+//   max_link_speed:     what the GPU itself is capable of, e.g. "32.0 GT/s"
+//   pp_dpm_pcie (amd):  the REAL negotiated speed/width (see readAmdPcie)
+//   current_link_*:     the negotiated values for non-amdgpu vendors; on
+//                       amdgpu they wrongly report the max, hence the first
+//                       branch. "current_link_speed" may also carry a max
+//                       suffix like "8.0 GT/s cap 16.0 GT/s" as a fallback.
+// Non-PCIe devices expose none of these files -> fields stay -1.
 static void readPcieLink(const std::string& devPath, DrmCard& c) {
+    const std::string ms = trim(readFile(devPath + "/max_link_speed", 64));
+    if (!ms.empty() && ms.find("GT/s") != std::string::npos)
+        c.pcieMaxGen = gtToGen(strtod(ms.c_str(), nullptr));
+
+    // amdgpu quirk: current_link_* report the MAX, not the negotiated state.
+    // pp_dpm_pcie is the only trustworthy source; when the GPU is
+    // runtime-suspended (no display attached) it returns EBUSY, in which case
+    // we report unknown rather than the wrong max value.
+    const std::string ven = trim(readFile(devPath + "/vendor", 64));
+    if (ven.find("1002") != std::string::npos) {
+        for (int t = 0; t < 3; ++t) {
+            if (readAmdPcie(devPath, c)) return;
+            usleep(20 * 1000); // SMU mutex may be briefly contended
+        }
+        return; // still unavailable: keep pcieGen/pcieWidth at -1
+    }
+
     const std::string spd = trim(readFile(devPath + "/current_link_speed", 64));
     if (!spd.empty() && spd.find("GT/s") != std::string::npos) {
         c.pcieGen = gtToGen(strtod(spd.c_str(), nullptr));
-        size_t capPos = spd.find("cap ");
-        if (capPos != std::string::npos) { // "... GT/s cap 16.0 GT/s"
-            const char* p2 = spd.c_str() + capPos + 4;
-            while (*p2 && !isdigit((unsigned char)*p2)) ++p2; // skip to the number
-            c.pcieMaxGen = gtToGen(strtod(p2, nullptr));
+        if (c.pcieMaxGen < 0) {
+            size_t capPos = spd.find("cap "); // "... GT/s cap 16.0 GT/s"
+            if (capPos != std::string::npos) {
+                const char* p2 = spd.c_str() + capPos + 4;
+                while (*p2 && !isdigit((unsigned char)*p2)) ++p2; // skip to the number
+                c.pcieMaxGen = gtToGen(strtod(p2, nullptr));
+            }
         }
     }
     long w = readLong(devPath + "/current_link_width");

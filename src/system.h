@@ -51,8 +51,8 @@ std::string fmtSmartKb(long kb);   // best-fit unit, e.g. "7.2G" / "512M"
 std::string fmtAlwaysGB(long kb);  // GB with one decimal, e.g. "1.4G"
 std::string fmtMiB(long mib);      // MiB values coming from the GPU tools
 
-// compact PCIe link description: "Gen4 x16"; when running below the max
-// supported generation: "Gen3/4 x16". Empty string when unknown.
+// compact PCIe link description: "Gen4 x16" (the actually negotiated
+// link speed/width). Empty string when unknown.
 std::string pcieLabel(const GpuInfo& g);
 
 // take a full snapshot (the first call builds its own ~300 ms CPU baseline)
