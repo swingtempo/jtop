@@ -288,6 +288,56 @@ static std::string hexId(const std::string& raw) {
     return t;
 }
 
+// GPU display name from PCI IDs "vid:did" (e.g. "1002:7551"), used when the
+// driver doesn't expose a /sys/class/drm/cardN/device/label file (amdgpu
+// usually doesn't). Resolution order:
+//   1. pci.ids database (the same file lspci reads) - full device name,
+//      e.g. "Navi 48 [Radeon AI PRO R9700]"
+//   2. tiny built-in vendor table ("AMD Radeon") so the popup/table always
+//      shows something meaningful
+// Returns "" only when both fail.
+static std::string pciIdName(const std::string& vid, const std::string& did) {
+    static const char* kDbPaths[] = {
+        "/usr/share/hwdata/pci.ids", // Debian/Ubuntu
+        "/usr/share/misc/pci.ids",   // some distros
+        "/usr/share/pci.ids",
+    };
+    std::string db;
+    for (const char* p : kDbPaths) { db = readFile(p, 1 << 20); if (!db.empty()) break; }
+
+    std::string name; // pci.ids device line, e.g. "Navi 48 [Radeon AI PRO R9700]"
+    if (!db.empty()) {
+        std::istringstream in(db);
+        std::string line;
+        bool inVendor = false;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            if (line[0] == '\t') { // "\t7551  Navi 48 [...]" (device under vendor)
+                if (inVendor && line.size() >= 7 &&
+                    line.compare(1, 4, did) == 0 &&
+                    line[5] == ' ' && line[6] == ' ') {
+                    name = line.substr(7);
+                    break;
+                }
+            } else { // "1002  Advanced Micro Devices, Inc. [AMD/ATI]"
+                inVendor = (line.size() >= 6 &&
+                            line.compare(0, 4, vid) == 0 &&
+                            line[4] == ' ' && line[5] == ' ');
+            }
+        }
+    }
+    if (!name.empty()) return name;
+
+    static const struct { const char* vid; const char* name; } kVendors[] = {
+        {"1002", "AMD Radeon"}, {"10de", "NVIDIA"}, {"8086", "Intel"},
+        {"1a03", "ASPEED"},    {"102b", "Matrox"}, {"1ae0", "Google"},
+        {"1af4", "VirtIO"},    {"1234", "QEMU"},
+    };
+    for (auto& v : kVendors)
+        if (vid == v.vid) return v.name;
+    return "";
+}
+
 // connector name prefix -> human kind: DP-1->DisplayPort, HDMI-A-2->HDMI,
 // eDP-1/LVDS-1->Internal, VGA-1->VGA, TV-1->TV-out; anything else (DVI-D,...)
 // keeps its drm prefix as-is
@@ -478,6 +528,12 @@ static std::vector<DrmCard> readDrmCards() {
             readPcieLink(rp, c);
         }
         c.label = trim(readFile(dev + "/label", 256)); // amdgpu/intel; often absent
+        if (c.label.empty() && !c.vendorDev.empty()) {  // fall back to PCI ID name
+            std::string v = c.vendorDev, d;
+            size_t col = v.find(':');
+            if (col != std::string::npos) { d = v.substr(col + 1); v = v.substr(0, col); }
+            c.label = pciIdName(v, d);
+        }
     }
     for (auto& c : cards)
         std::sort(c.conns.begin(), c.conns.end(),

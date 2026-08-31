@@ -28,7 +28,12 @@ Hovering over any GPU or VRAM column pops up a small card with the device's
 name, PCI address/IDs, PCIe link speed (`PCIe Gen4 x16` — the actually
 negotiated link, not the card's max capability) and its display connections
 (`DP-1 DisplayPort`, `HDMI-A-2 HDMI`, ...) including resolution when
-connected; moving away hides it. Connections come from `/sys/class/drm` on
+connected; moving away hides it. The device name comes from the driver's
+`/sys/class/drm/cardN/device/label` when present, otherwise it is resolved
+from the PCI vendor/device IDs via the system's `pci.ids` database (the same
+file `lspci` uses; a small built-in vendor table is the last resort) — so an
+AMD card shows e.g. `Navi 48 [Radeon AI PRO R9700]` even though amdgpu
+exposes no label. Connections come from `/sys/class/drm` on
 every vendor path (NVIDIA needs `nvidia-drm.modeset=1` for that; a headless
 card shows none). The PCIe state is the **real negotiated link**: amdgpu's
 `current_link_speed`/`current_link_width` sysfs files wrongly report the GPU's
