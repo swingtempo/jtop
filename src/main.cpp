@@ -540,7 +540,7 @@ static double detectUiScale(Display* dpy, const std::string& activeConnector) {
 // ---------------------------------------------------------------------------
 
 struct Col {
-    std::string label;  // small grey text on top, e.g. "GPU 0"
+    std::string label;  // small grey text on top, e.g. "GPU0"
     std::string value;  // big text below,          e.g. "94%"
     bool hot = false;   // red + underline (as in the reference shot)
 };
@@ -561,7 +561,7 @@ struct View {
 
 // layout metrics (single source of truth for sizing + painting)
 struct Metrics {
-    double labelPx = 10.5, valuePx = 19.0;
+    double labelPx = 19, valuePx = 19.0;
     double padX = 13.0, gap = 22.0, outerPad = 15.0, topPad = 13.0, botPad = 12.5;
     double midGap = 7.0;
 
@@ -617,30 +617,23 @@ static void roundRect(cairo_t* cr, double x, double y, double w, double h, doubl
 }
 
 static std::vector<Col> buildColumns(const Snapshot& s) {
-    auto tempCol = [](const std::string& label, int t) -> Col {
-        return {label, (t < 0 ? "--" : (std::to_string(t) + "\xC2\xB0")), t >= 90}; // ° UTF-8
-    };
-
     std::vector<Col> cols;
-    cols.push_back({"CPU",  s.cpuPct < 0 ? "--" : (std::to_string(s.cpuPct) + "%"),
-                    s.cpuPct >= 90});
+    cols.push_back({"CPU",  s.cpuPct < 0 ? "--" : (std::to_string(s.cpuPct) + "% " + std::to_string(s.cpuTempC) + "\xC2\xB0"),
+                    s.cpuPct >= 90 || s.cpuTempC >= 90});
     cols.push_back({"RAM", fmtSmartKb(s.ramUsedKb), false});
     cols.push_back({"SWAP", s.hasSwap ? fmtAlwaysGB(s.swapUsedKb) : "--", false});
-    cols.push_back(tempCol("CPU \xC2\xB0", s.cpuTempC));
 
     for (size_t i = 0; i < s.gpus.size(); ++i)
-        cols.push_back({"GPU " + std::to_string(i),
-                        s.gpus[i].util < 0 ? "--" : (std::to_string(s.gpus[i].util) + "%"),
-                        s.gpus[i].util >= 90});
+        cols.push_back({"GPU" + std::to_string(i),
+                        (s.gpus[i].util < 0 ? "--" : (std::to_string(s.gpus[i].util) + "% ") + std::to_string(s.gpus[i].tempC) + "\xC2\xB0"),
+                        s.gpus[i].util >= 90 || s.gpus[i].tempC >= 90});
     for (size_t i = 0; i < s.gpus.size(); ++i) {
         const auto& gp = s.gpus[i];
         bool hotVram = false;
         if (gp.vramTotalMiB > 0 && gp.vramUsedMiB >= 0)
             hotVram = (double)gp.vramUsedMiB / gp.vramTotalMiB >= 0.95;
-        cols.push_back({"VRAM " + std::to_string(i), fmtMiB(gp.vramUsedMiB), hotVram});
+        cols.push_back({"VRAM" + std::to_string(i), fmtMiB(gp.vramUsedMiB), hotVram});
     }
-    for (size_t i = 0; i < s.gpus.size(); ++i)
-        cols.push_back(tempCol("GPU \xC2\xB0 " + std::to_string(i), s.gpus[i].tempC));
     return cols;
 }
 
