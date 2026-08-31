@@ -86,31 +86,44 @@ GPU1 util=5   vram=2.5G   /21.9G   temp=57°
 The indented lines are the same data the hover popup shows (device name, PCI
 identity and per-connector status).
 
-### `--table`: terminal table + no-display fallback
+### `--table`: terminal view + no-display fallback
 
-`--table` renders the same data as an aligned table. It is also jtop's
-**automatic fallback when no X display can be opened** (e.g. a plain SSH
-session): instead of quitting, the app prints a note on stderr and runs in
-terminal mode — nothing to remember.
-
-In an interactive terminal it redraws every 5 s like the GUI (Ctrl-C quits);
-when stdout is piped or redirected it prints one table and exits — handy for
-logs, tickets and CI:
+`--table` renders the data as one concise line per GPU — identity, PCI and
+stats are each shown exactly once (the `CONN` column summarizes display
+collectors as *connected/total*). It is also jtop's **automatic fallback when
+no X display can be opened** (e.g. a plain SSH session): instead of quitting,
+the app prints a note on stderr and runs in terminal mode — nothing to
+remember.
 
 ```sh
 ./build/jtop --table            # live while attached to a tty
 env -u DISPLAY ./build/jtop     # same thing via the auto-fallback
 ```
 
-Sample output (one row per GPU + connector; widths adapt to the data):
+In an interactive terminal it redraws every 5 s like the GUI. Keys: **c**
+toggles the per-GPU connection detail lines on/off, **q** or Ctrl-C quits (the
+tty is restored either way). When stdout is piped or redirected it prints one
+compact table and exits — handy for logs/tickets/CI; use `--dump` there if you
+want the full machine-readable snapshot incl. per-connector details.
+
+Default view:
 
 ```
-CPU 8%   RAM 33.7G   SWAP 1.4G   CPU° 47
-#  DEVICE  PCI           VENDOR:ID  UTIL           VRAM  TEMP  CONN      TYPE         STATUS        RESOLUTION
--  ------  ------------  ---------  ----  -------------  ----  --------  -----------  ------------  ----------
-0  --      0000:0b:00.0  1002:7551   47%  15.9G / 31.9G   68°  DP-4      DisplayPort  disconnected          --
-...
-1  --      0000:06:00.0  1002:7551   46%  16.2G / 31.9G   94°  HDMI-A-1  HDMI         connected      3840x2160
+CPU 3%   RAM 27.8G   SWAP 1.4G   CPU° 35
+#  DEVICE  PCI                       UTIL           VRAM  TEMP  CONN
+-  ------  ------------------------  ----  -------------  ----  ----
+0  --      0000:0b:00.0 [1002:7551]    0%    57M / 31.9G   32°  0/4
+1  --      0000:06:00.0 [1002:7551]    8%  29.5G / 31.9G   70°  2/4
+```
+
+With connection details shown (after pressing **c**):
+
+```
+0  --      0000:0b:00.0 [1002:7551]    0%    57M / 31.9G   32°  0/4
+      DP-4       DisplayPort  off
+      ...                                            
+1  --      0000:06:00.0 [1002:7551]    8%  29.5G / 31.9G   70°  2/4
+      DP-2       DisplayPort  connected  3840x2160
 ```
 
 ## DPI / scaling
