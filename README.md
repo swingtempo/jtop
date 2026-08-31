@@ -81,9 +81,14 @@ UI scale. Detection order (first hit wins):
 1. `JTOP_SCALE` env var — manual override, e.g. `JTOP_SCALE=2 ./jtop`
 2. `GDK_DPI_X` / `GDK_DPI_Y` (dots per inch; 96 = no scaling)
 3. `GDK_SCALE` integer factor
-4. GNOME settings: `scaling-factor` x `text-scaling-factor`
+4. `$XDG_CONFIG_HOME/monitors.xml` (else `~/.config/monitors.xml`) — Mutter's saved
+display configuration: the scale of **the monitor under the pointer**, taken from the
+`<configuration>` block whose connectors best match the currently connected outputs
+(per-monitor fractional scaling). The file only exists when a custom/saved display
+layout is active in GNOME.
+5. GNOME settings: `scaling-factor` x `text-scaling-factor`
    (`org.gnome.desktop.interface`) — i.e. follows the normal display-scale UI setting
-5. Physical screen DPI from X (only honored above ~145 dpi, clamped to 2x)
+6. Physical screen DPI from X (only honored above ~145 dpi, clamped to 2x)
 
 On a standard unscaled desktop this resolves to 1.0 and the layout is
 exactly the original pixel design.

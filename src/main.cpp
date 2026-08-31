@@ -48,10 +48,15 @@
 static std::string readFile(const std::string& path, size_t maxBytes = 65536) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return "";
+    std::string out;
     char buf[8192];
-    size_t n = fread(buf, 1, sizeof(buf), f);
+    while (out.size() < maxBytes) { // chunked so files > one page are read fully
+        size_t n = fread(buf, 1, std::min(sizeof(buf), maxBytes - out.size()), f);
+        if (n == 0) break;
+        out.append(buf, n);
+    }
     fclose(f);
-    return std::string(buf, n < maxBytes ? n : maxBytes);
+    return out;
 }
 
 // returns -1 when missing or unparseable
@@ -422,10 +427,15 @@ static void printDump(const Snapshot& s) {
 //   1. JTOP_SCALE env var      - manual override, any float > 0
 //   2. GDK_DPI_X / GDK_DPI_Y   - dots per inch, factor = value / 96
 //   3. GDK_SCALE               - integer factor >= 1
-//   4. GNOME settings          - gsettings scaling-factor * text-scaling-factor
+//   4. monitors.xml            - Mutter's saved display configuration: per-monitor
+//                                fractional scale of the monitor under the pointer,
+//                                from the <configuration> block matching the live
+//                                xrandr outputs (only exists when a custom/saved
+//                                GNOME layout is active)
+//   5. GNOME settings          - gsettings scaling-factor * text-scaling-factor
 //                                (0 == "auto" -> counts as 1; the whole step is
 //                                 skipped if gsettings is missing or fails)
-//   5. physical X screen DPI   - avg dpi / 96 clamped to [1,2]; returns 1.0 when
+//   6. physical X screen DPI   - avg dpi / 96 clamped to [1,2]; returns 1.0 when
 //                                the reported size implies < ~145 dpi so plain
 //                                unscaled desktops are not over-scaled
 // The result is finally clamped to [1.0, 3.0]. Unscaled sessions resolve to
@@ -477,7 +487,11 @@ static bool gnomeSettingDouble(const char* key, double& out) {
     return false;
 }
 
-static double detectUiScale(Display* dpy) {
+// monitors.xml lookup (defined further down next to monitorRects(), whose
+// output names it reuses for configuration-block matching)
+static double monitorsXmlScale(const std::string& activeConnector);
+
+static double detectUiScale(Display* dpy, const std::string& activeConnector) {
     const auto clamp = [](double x) { return std::max(1.0, std::min(x, 3.0)); };
     double v;
 
@@ -492,7 +506,13 @@ static double detectUiScale(Display* dpy) {
     const char* gs = getenv("GDK_SCALE");
     if (gs && *gs) { int f = atoi(gs); if (f >= 1) return clamp((double)f); }
 
-    // 4) GNOME interface settings (both keys must succeed, else fall through)
+    // 4) Mutter's saved display configuration (monitors.xml): the per-monitor
+    //    scale of the monitor under the pointer. This is what carries GNOME's
+    //    fractional scaling when nothing above knows it.
+    double mxs = monitorsXmlScale(activeConnector);
+    if (mxs > 0.0) return clamp(mxs);
+
+    // 5) GNOME interface settings (both keys must succeed, else fall through)
     double sf = 0.0, tsf = 0.0;
     if (gnomeSettingDouble("org.gnome.desktop.interface scaling-factor", sf) &&
         gnomeSettingDouble("org.gnome.desktop.interface text-scaling-factor", tsf)) {
@@ -500,7 +520,7 @@ static double detectUiScale(Display* dpy) {
         return clamp(sf * tsf);
     }
 
-    // 5) physical screen DPI reported by the X server
+    // 6) physical screen DPI reported by the X server
     double dpiX = -1.0, dpiY = -1.0;
     if (dpy) {
         int scr = DefaultScreen(dpy);
@@ -748,7 +768,7 @@ static void setEwmhHints(View& v) {
     XStoreName(d, v.win, "jtop");
 }
 
-struct OutRect { int x, y, w, h; bool primary; };
+struct OutRect { int x, y, w, h; bool primary; std::string name; };
 
 // Ask the `xrandr` CLI for connected outputs (avoids linking libXrandr).
 // On Mutter/GNOME X11 all monitors form ONE merged root window, so "top
@@ -768,6 +788,8 @@ static std::vector<OutRect> monitorRects() {
         const char* tok = line.c_str() + p + 10; // skip past " connected"
         while (*tok == ' ') ++tok;
         OutRect r{0, 0, 0, 0, false};
+        size_t sp = line.find_first_of(" \t"); // output name is the line prefix
+        if (sp != std::string::npos) r.name = trim(line.substr(0, sp));
         if (!std::strncmp(tok, "primary ", 8)) { r.primary = true; tok += 8; }
         int x = 0, y = 0, w = 0, h = 0;
         // geometry token looks like 6144x3456+0+1874 (rotation already accounted for)
@@ -780,24 +802,137 @@ static std::vector<OutRect> monitorRects() {
     return out;
 }
 
+// The connected output whose rectangle contains the pointer (XQueryPointer on
+// the given root window); falls back to the primary monitor, then the first.
+static const OutRect* pointerMonitor(Display* dpy, Window root,
+                                     const std::vector<OutRect>& rects) {
+    if (!dpy || rects.empty()) return nullptr;
+    Window rr = None, cr = None;
+    int xr = 0, yr = 0, xd = 0, yd = 0; unsigned mask = 0;
+    if (XQueryPointer(dpy, root, &rr, &cr, &xr, &yr, &xd, &yd, &mask))
+        for (const auto& r : rects)
+            if (xr >= r.x && xr < r.x + r.w && yr >= r.y && yr < r.y + r.h) return &r;
+    for (const auto& r : rects) if (r.primary) return &r; // no pointer match -> primary
+    return &rects[0];
+}
+
+// Mutter's saved display configuration: $XDG_CONFIG_HOME/monitors.xml (else
+// ~/.config/monitors.xml) holds ONE <configuration> block per distinct hardware
+// state GNOME has seen, each with a <scale> per logicalmonitor. Connector names
+// get renamed across reboots (DP-1 -> DP-2 ...), so stale blocks must be
+// filtered out: pick the block whose connectors best match the outputs xrandr
+// reports as connected right now (exact set match beats partial overlap, then
+// most matches) and return its scale for activeConnector (case-sensitive).
+// Falls back to the value all entries of that block share. Returns 0 ("not
+// found / ambiguous") when the file is missing, no live output appears in any
+// block, or no unambiguous scale can be derived. Parsed with strstr/substr only.
+static double monitorsXmlScale(const std::string& activeConnector) {
+    // path: $XDG_CONFIG_HOME/monitors.xml else ~/.config/monitors.xml
+    std::string path;
+    if (const char* x = getenv("XDG_CONFIG_HOME")) {
+        if (*x) path = std::string(x) + "/monitors.xml";
+    } else if (const char* h = getenv("HOME")) {
+        if (*h) path = std::string(h) + "/.config/monitors.xml";
+    }
+    if (path.empty()) return 0.0;
+
+    std::string data = readFile(path, 1 << 20); // few KB in practice; room to grow
+    if (data.empty()) return 0.0;               // no saved config -> fall through
+
+    // currently-connected outputs (names come from xrandr via monitorRects)
+    std::vector<std::string> live;
+    for (const auto& r : monitorRects()) live.push_back(r.name);
+    if (live.empty()) return 0.0;               // cannot match any block
+
+    // trimmed inner text of <tag>...</tag> within seg, "" when absent
+    const auto tagContent = [](const std::string& seg, const char* openTag) -> std::string {
+        size_t a = seg.find(openTag);
+        if (a == std::string::npos) return "";
+        a += strlen(openTag);
+        std::string closeTag = std::string("</") + (openTag + 1); // "<x>" -> "</x>"
+        size_t b = seg.find(closeTag, a);
+        if (b == std::string::npos) return "";
+        return trim(seg.substr(a, b - a));
+    };
+
+    struct Entry { std::string conn; double scale; };
+    const char* openCfg  = "<configuration>";
+    const char* closeCfg = "</configuration>";
+    const char* openLm   = "<logicalmonitor>";
+    const char* closeLm  = "</logicalmonitor>";
+
+    int bestMatch = 0, bestScore = -1;
+    std::vector<Entry> bestEntries;
+
+    size_t pos = 0;
+    while (true) {
+        size_t b0 = data.find(openCfg, pos);
+        if (b0 == std::string::npos) break;
+        size_t e0 = data.find(closeCfg, b0 + strlen(openCfg));
+        if (e0 == std::string::npos) break; // malformed tail -> ignore the rest
+        std::string block = data.substr(b0, e0 - b0 + strlen(closeCfg));
+        pos = e0 + strlen(closeCfg);
+
+        std::vector<Entry> entries;
+        size_t p2 = 0;
+        while (true) {
+            size_t m0 = block.find(openLm, p2);
+            if (m0 == std::string::npos) break;
+            size_t m1 = block.find(closeLm, m0 + strlen(openLm));
+            size_t len = (m1 == std::string::npos) ? std::string::npos : m1 - m0;
+            if (m1 == std::string::npos) p2 = block.size(); // unterminated tail element
+            else                          p2 = m1 + strlen(closeLm);
+            std::string el = block.substr(m0, len);
+
+            double sc = 0.0; // per-monitor scale (stays 0 when the tag is absent)
+            {
+                std::string t = tagContent(el, "<scale>");
+                if (!t.empty()) {
+                    char* endp = nullptr;
+                    double dv = strtod(t.c_str(), &endp);
+                    if (endp != t.c_str() && *endp == '\0') sc = dv; // strict number
+                }
+            }
+            std::string conn = tagContent(el, "<connector>");
+            if (!conn.empty()) entries.push_back({conn, sc});
+        }
+
+        int match = 0; // how many live outputs appear in this block
+        for (const auto& en : entries)
+            for (const auto& n : live)
+                if (en.conn == n) { ++match; break; } // count each output once
+        bool exact = (entries.size() == live.size() && match == (int)live.size());
+
+        int score = 2 * match + (exact ? 1 : 0); // exact set beats partial overlap
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = match;
+            bestEntries = std::move(entries);
+        }
+    }
+    if (bestMatch <= 0) return 0.0;              // nothing live in any saved block
+
+    for (const auto& en : bestEntries)
+        if (!activeConnector.empty() && en.conn == activeConnector && en.scale > 0.0)
+            return en.scale;
+
+    // no per-monitor hit: use the value when every scaled entry agrees on it
+    double common = -1.0;
+    for (const auto& en : bestEntries) {
+        if (en.scale <= 0.0) continue;           // unscaled monitor -> no info
+        if (common < 0.0)      common = en.scale;
+        else if (en.scale != common) return 0.0; // mixed scales -> ambiguous
+    }
+    return common > 0.0 ? common : 0.0;
+}
+
 // Move the (still unmapped) widget to the top-right of the monitor that
 // currently holds the pointer, i.e. where the user ran the app and is looking.
 static void placeTopRight(View& v) {
     const int margin = 24;
     auto rects = monitorRects();
 
-    const OutRect* mon = nullptr;
-    if (!rects.empty()) {
-        Window rootRet = None, childRet = None;
-        int xr = 0, yr = 0, xd = 0, yd = 0; unsigned mask = 0;
-        XQueryPointer(v.dpy, v.root, &rootRet, &childRet, &xr, &yr, &xd, &yd, &mask);
-        int px = xr, py = yr;
-        for (auto& r : rects)
-            if (px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h) { mon = &r; break; }
-        if (!mon)
-            for (auto& r : rects) if (r.primary) { mon = &r; break; } // no pointer match -> primary
-        if (!mon) mon = &rects[0];
-    }
+    const OutRect* mon = pointerMonitor(v.dpy, v.root, rects);
 
     int x, y;
     if (mon) {
@@ -979,8 +1114,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "jtop: cannot open X display (is DISPLAY set?)\n");
         return 1;
     }
+    // Which connected output sits under the pointer? Needed before any window
+    // exists so monitors.xml's per-monitor scale can be picked for it.
+    auto startupRects = monitorRects();
+    const OutRect* ptrMon =
+        pointerMonitor(dpy, RootWindow(dpy, DefaultScreen(dpy)), startupRects);
+    std::string activeConn = (ptrMon && !ptrMon->name.empty()) ? ptrMon->name : "";
+
     // Resolve the session UI scale once, before any window/geometry decision.
-    g_uiScale = detectUiScale(dpy);
+    g_uiScale = detectUiScale(dpy, activeConn);
 
     View v{};
     int rc = createWindow(v, dpy);
