@@ -15,6 +15,7 @@
 // Interaction:
 //   left mouse button  : drag to move the widget
 //   right mouse button : quit
+//   hover a GPU column : popup with device name, PCI info and display connections
 //   auto refresh       : every 5 seconds while running
 
 #include <X11/Xlib.h>
@@ -242,11 +243,24 @@ static int cpuTempC() {
 // GPUs: NVIDIA via nvidia-smi, otherwise amdgpu/radeon/nvidia via sysfs
 // ---------------------------------------------------------------------------
 
+static std::string pciCanon(const std::string& s); // defined below; needed by the nvidia-smi parser
+
+struct GpuConn {
+    std::string name;   // drm connector, e.g. "DP-1" / "HDMI-A-2"
+    std::string kind;   // human form,      e.g. "DisplayPort", "HDMI"
+    bool connected = false;
+    std::string mode;   // first listed mode, e.g. "3840x2160@60Hz" (only when connected)
+};
+
 struct GpuInfo {
     int  util = -1;         // % or -1
     long vramUsedMiB = -1;  // MiB or -1
     long vramTotalMiB = -1;
     int  tempC = -1;        // °C or -1
+    std::string name;       // device name (nvidia-smi / sysfs label) or ""
+    std::string pciAddr;    // canonical PCI address, e.g. "0000:65:00.0", or ""
+    std::string pciIds;     // vendor:device hex IDs, e.g. "10de:2684", or ""
+    std::vector<GpuConn> conns;  // drm display connectors of this GPU
 };
 
 static std::vector<GpuInfo> nvidiaGpus() {
@@ -258,8 +272,8 @@ static std::vector<GpuInfo> nvidiaGpus() {
     std::vector<GpuInfo> out;
     if (!ok) return out;
 
-    const char* cmd = "nvidia-smi --query-gpu=index,utilization.gpu,"
-                      "memory.used,memory.total,temperature.gpu "
+    const char* cmd = "nvidia-smi --query-gpu=index,name,memory.used,"
+                      "memory.total,temperature.gpu,utilization.gpu,pci.bus_id "
                       "--format=csv,noheader,nounits 2>/dev/null";
     FILE* p = popen(cmd, "r");
     if (!p) return out;
@@ -277,10 +291,12 @@ static std::vector<GpuInfo> nvidiaGpus() {
             long v = strtol(s.c_str(), &end, 10);
             bool num = (end != s.c_str()); // rejects "[N/A]" etc.
             switch (f) {
-                case 2: if (num) g.util = (int)v;       break; // utilization.gpu %
-                case 3: if (num) g.vramUsedMiB = v;     break; // MiB
-                case 4: if (num) g.vramTotalMiB = v;    break; // MiB
-                case 5: if (num) g.tempC = (int)v;      break; // °C
+                case 2: g.name = s;                      break; // display name (may contain spaces)
+                case 3: if (num) g.vramUsedMiB = v;      break; // MiB
+                case 4: if (num) g.vramTotalMiB = v;     break; // MiB
+                case 5: if (num) g.tempC = (int)v;       break; // °C
+                case 6: if (num) g.util = (int)v;        break; // utilization.gpu %
+                case 7: g.pciAddr = pciCanon(s);         break; // bus id, canonical form
             }
             rest = com ? com + 1 : nullptr;
         }
@@ -290,20 +306,145 @@ static std::vector<GpuInfo> nvidiaGpus() {
     return out;
 }
 
-static std::vector<GpuInfo> sysfsGpus() {
-    struct Card { int n; std::string path; };
-    std::vector<Card> cards;
+// Canonical PCI address: "00000000:65:00.0" (nvidia-smi style, 8-hex domain)
+// and "0000:65:00.0" (sysfs realpath basename) both become "0000:65:00.0",
+// so values from the two sources can be compared for equality.
+static std::string pciCanon(const std::string& s) {
+    if (s.empty()) return "";
+    unsigned long dom = 0, bus = 0, devfn = 0; int fn = -1;
+    if (sscanf(s.c_str(), "%lx:%lx:%lx.%d", &dom, &bus, &devfn, &fn) < 3) return s;
+    char b[24];
+    snprintf(b, sizeof(b), "%04lx:%02lx:%02lx.%d", dom, bus, devfn, fn);
+    return b;
+}
+
+// "0x10de\n" -> "10de" (lowercase hex without prefix); empty stays empty
+static std::string hexId(const std::string& raw) {
+    std::string t = trim(raw);
+    if (t.size() > 2 && (t.compare(0, 2, "0x") == 0 || t.compare(0, 2, "0X") == 0))
+        t.erase(0, 2);
+    for (auto& c : t) c = tolower((unsigned char)c);
+    return t;
+}
+
+// connector name prefix -> human kind: DP-1->DisplayPort, HDMI-A-2->HDMI,
+// eDP-1/LVDS-1->Internal, VGA-1->VGA, TV-1->TV-out; anything else (DVI-D,...)
+// keeps its drm prefix as-is
+static std::string connKind(const std::string& nm) {
+    size_t d = nm.find('-');
+    std::string p = (d == std::string::npos ? nm : nm.substr(0, d));
+    for (auto& c : p) c = toupper((unsigned char)c);
+    if      (p == "DP")                 return "DisplayPort";
+    else if (p == "eDP" || p == "LVDS") return "Internal";
+    else if (p == "VGA")                return "VGA";
+    else if (!p.empty() && p[0] == 'T' && p.size() >= 2) return "TV-out"; // TV-1 etc.
+    return p;
+}
+
+// First modeline of <conn>/modes. Old kernels print full modelines
+// ("HxV DotMHz h0 h1 HT v0 v1 VT flags..."), newer ones just plain "HxV" lines.
+// Returns e.g. "3840x2160@60Hz" when the refresh can be derived, else "HxV",
+// or "" when nothing is available (typical for disconnected connectors).
+static std::string connFirstMode(const std::string& connPath) {
+    std::string raw = readFile(connPath + "/modes", 512);
+    size_t eol = raw.find('\n');
+    if (eol != std::string::npos) raw.resize(eol); // first line only
+    raw = trim(raw);
+    int w = 0, h = 0; double mhz = 0.0; long ht = 0, vt = 0;
+    // tokens after "HxV": DotMHz hsStart hsEnd HTOTAL vsStart vsEnd VTOTAL
+    int n = std::sscanf(raw.c_str(), "%dx%d %lf %*d %*d %ld %*d %*d %ld",
+                        &w, &h, &mhz, &ht, &vt);
+    if (n < 2 || w <= 0 || h <= 0) return "";
+    char b[48];
+    if (n >= 5 && ht > 0 && vt > 0 && mhz > 0.0) {
+        long hz = (long)(mhz * 1e6 / ((double)ht * (double)vt)); // dot rate / px per frame
+        if (hz >= 20 && hz <= 400) { snprintf(b, sizeof b, "%dx%d@%ldHz", w, h, hz); return b; }
+    }
+    snprintf(b, sizeof b, "%dx%d", w, h);
+    return b;
+}
+
+// All /sys/class/drm cardN devices with PCI identity and their drm display
+// connectors ("card0-DP-1" etc.). Feeds the GPU hover popup on every vendor
+// path; writeback/virtual outputs are not real display connections -> skipped.
+struct DrmCard {
+    int n = -1;
+    std::string path;      // /sys/class/drm/cardN
+    std::string pciAddr;   // canonical "0000:65:00.0" or ""
+    std::string label;     // device/label (amdgpu/intel expose it) or ""
+    std::string vendorDev; // PCI IDs, e.g. "10de:2684", or ""
+    std::vector<GpuConn> conns;
+};
+
+static std::vector<DrmCard> readDrmCards() {
+    struct Pending { int n; GpuConn c; }; // connectors seen before their card entry
+    std::vector<DrmCard> cards;
+    std::vector<Pending> pend;
+
     if (DIR* d = opendir("/sys/class/drm")) {
         while (struct dirent* e = readdir(d)) {
             const char* nm = e->d_name;
             if (strncmp(nm, "card", 4) != 0 || !isdigit((unsigned char)nm[4])) continue;
-            cards.push_back({atoi(nm + 4), std::string("/sys/class/drm/") + nm});
+            const char* p = nm + 4;
+            std::string digits;
+            while (*p && isdigit((unsigned char)*p)) { digits += *p; ++p; }
+            if (digits.empty()) continue;
+            int cn = atoi(digits.c_str());
+
+            if (!*p) { // plain "cardN" -> the GPU device itself
+                cards.push_back({cn, std::string("/sys/class/drm/") + nm});
+            } else if (*p == '-') { // "card0-DP-1" -> a connector of card 0
+                std::string cname = p + 1;
+                std::string up = cname; for (auto& ch : up) ch = toupper((unsigned char)ch);
+                if (!up.compare(0, 9, "WRITEBACK") || !up.compare(0, 7, "VIRTUAL")) continue;
+
+                GpuConn gc;
+                gc.name = cname;
+                gc.kind = connKind(cname);
+                std::string base = std::string("/sys/class/drm/") + nm;
+                gc.connected = (trim(readFile(base + "/status", 64)) == "connected");
+                if (gc.connected) gc.mode = connFirstMode(base);
+                pend.push_back({cn, std::move(gc)});
+            }
         }
         closedir(d);
     }
-    std::sort(cards.begin(), cards.end(),
-              [](const Card& a, const Card& b) { return a.n < b.n; });
 
+    for (auto& pc : pend)
+        for (auto& card : cards)
+            if (card.n == pc.n) { card.conns.push_back(pc.c); break; }
+
+    std::sort(cards.begin(), cards.end(),
+              [](const DrmCard& a, const DrmCard& b) { return a.n < b.n; });
+
+    for (auto& c : cards) {
+        std::string dev = c.path + "/device";
+        char real[PATH_MAX]; // glibc's FORTIFY wrapper requires a PATH_MAX-sized buffer
+        if (realpath(dev.c_str(), real)) { // kernel puts relative symlinks here; the
+            std::string rp(real);           // basename of the target IS the PCI address
+            size_t sl = rp.find_last_of('/');
+            c.pciAddr = pciCanon(sl == std::string::npos ? rp : rp.substr(sl + 1));
+            std::string vid = hexId(readFile(rp + "/vendor", 64));
+            std::string did = hexId(readFile(rp + "/device", 64));
+            if (!vid.empty() && !did.empty()) c.vendorDev = vid + ":" + did;
+        }
+        c.label = trim(readFile(dev + "/label", 256)); // amdgpu/intel; often absent
+    }
+    for (auto& c : cards)
+        std::sort(c.conns.begin(), c.conns.end(),
+                  [](const GpuConn& a, const GpuConn& b) { return a.name < b.name; });
+    return cards;
+}
+
+static void attachMeta(GpuInfo& g, const DrmCard* c) {
+    if (!c) return;
+    if (g.name.empty() && !c->label.empty())  g.name = c->label;
+    if (g.pciAddr.empty())                    g.pciAddr = c->pciAddr;
+    if (g.pciIds.empty())                     g.pciIds = c->vendorDev;
+    g.conns = c->conns;
+}
+
+static std::vector<GpuInfo> sysfsGpus(const std::vector<DrmCard>& cards) {
     std::vector<GpuInfo> out;
     for (auto& c : cards) {
         std::string dev = c.path + "/device";
@@ -339,15 +480,27 @@ static std::vector<GpuInfo> sysfsGpus() {
         }
 
         // only report cards that actually expose something GPU-like
-        if (g.util >= 0 || g.vramTotalMiB > 0 || g.tempC >= 0) out.push_back(g);
+        if (g.util >= 0 || g.vramTotalMiB > 0 || g.tempC >= 0) {
+            attachMeta(g, &c); // name / PCI identity / display connectors
+            out.push_back(std::move(g));
+        }
     }
     return out;
 }
 
 static std::vector<GpuInfo> collectGpus() {
+    auto cards = readDrmCards(); // PCI metadata + drm connectors of every card
     auto nv = nvidiaGpus();
-    if (!nv.empty()) return nv; // assume all GPUs are NVIDIA when the driver works
-    return sysfsGpus();
+    if (!nv.empty()) {           // assume all GPUs are NVIDIA when the driver works
+        for (auto& g : nv) {
+            const DrmCard* m = nullptr;
+            for (const auto& c : cards)
+                if (!g.pciAddr.empty() && c.pciAddr == g.pciAddr) { m = &c; break; }
+            attachMeta(g, m); // display connectors (+ label fallback when smi lacks a name)
+        }
+        return nv;
+    }
+    return sysfsGpus(cards);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +570,22 @@ static void printDump(const Snapshot& s) {
         printf("GPU%zu util=%-3s vram=%-6s/%-6s temp=%s°\n",
                i, g(gp.util).c_str(), fmtMiB(gp.vramUsedMiB).c_str(),
                fmtMiB(gp.vramTotalMiB).c_str(), g(gp.tempC).c_str());
+        // device / PCI details + display connections (same data as the hover popup)
+        if (!gp.name.empty() || !gp.pciAddr.empty() || !gp.pciIds.empty()) {
+            std::string m;
+            m += gp.name.empty() ? "--" : gp.name;
+            if (!gp.pciAddr.empty()) m += "  pci " + gp.pciAddr;
+            if (!gp.pciIds.empty())  m += " (" + gp.pciIds + ")";
+            printf("      %s\n", m.c_str());
+        }
+        for (const auto& cn : gp.conns) {
+            const char* st = cn.connected ? "connected" : "off";
+            if (!cn.mode.empty())
+                printf("      %-10s %-12s %s  %s\n", cn.name.c_str(), cn.kind.c_str(),
+                       st, cn.mode.c_str());
+            else
+                printf("      %-10s %-12s %s\n", cn.name.c_str(), cn.kind.c_str(), st);
+        }
     }
 }
 
@@ -545,6 +714,13 @@ struct Col {
     bool hot = false;   // red + underline (as in the reference shot)
 };
 
+// x-extent of one column in the last rendered frame; gpu >= 0 marks GPU/VRAM
+// columns so pointer motion can be hit-tested against them for hover popups.
+struct ColRect {
+    double x = 0, w = 0;
+    int gpu = -1;
+};
+
 struct View {
     Display* dpy = nullptr;
     int screen = 0, rootW = 0, rootH = 0;
@@ -553,8 +729,22 @@ struct View {
     Visual* visual = nullptr;
     bool argb = false;
 
+    Colormap cmap = None; // shared by the main and popup window
+    int depth = 24;
+    unsigned long bgPixel = 0;
+
     bool dragging = false;
     int dragDX = 0, dragDY = 0;
+
+    std::vector<ColRect> colRects; // per-column hit areas (last render)
+    int mx = -1, my = -1;          // last pointer pos in window coords (-1: none)
+
+    // GPU hover popup state
+    Window popWin = None;
+    cairo_surface_t* popSurf = nullptr;
+    int popW = 0, popH = 0;
+    bool popShown = false;
+    int popGpu = -1;              // which GPU index the shown popup describes
 
     int winW = 240, winH = 68;
 };
@@ -637,6 +827,21 @@ static std::vector<Col> buildColumns(const Snapshot& s) {
     return cols;
 }
 
+// x-extent of every column under the current layout. Painting and pointer
+// hit-testing both use this, so what you see is exactly what you can point at.
+static std::vector<ColRect> layoutCols(cairo_t* cr, const Metrics& M,
+                                       const std::vector<Col>& cols) {
+    std::vector<ColRect> out;
+    double x = M.outerPad;
+    for (size_t i = 0; i < cols.size(); ++i) {
+        ColRect r{x, M.colWidth(cr, cols[i]), -1};
+        out.push_back(r);
+        x += r.w;
+        if (i + 1 < cols.size()) x += M.gap;
+    }
+    return out;
+}
+
 // paints one full widget frame onto `cr` (X window or a plain image surface)
 static void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
                           const std::vector<Col>& cols) {
@@ -664,10 +869,10 @@ static void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
     const double labelBase = M.labelBase();
     const double valueBase = M.valueBase();
 
-    double x = M.outerPad;
+    std::vector<ColRect> rects = layoutCols(cr, M, cols);
     for (size_t i = 0; i < cols.size(); ++i) {
         if (i > 0) { // subtle separator in the gap between columns
-            double sx = x - M.gap / 2.0 + 0.5;
+            double sx = rects[i].x - M.gap / 2.0 + 0.5;
             cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
             const double sepIn = 16.0 * g_uiScale; // vertical insets scale too
             cairo_move_to(cr, sx, sepIn);
@@ -675,32 +880,32 @@ static void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
             cairo_stroke(cr);
         }
 
+        const Col& c = cols[i];
+        double x = rects[i].x;
+
         // label
         cairo_set_font_size(cr, M.labelPx);
         cairo_text_extents_t el;
-        cairo_text_extents(cr, cols[i].label.c_str(), &el);
+        cairo_text_extents(cr, c.label.c_str(), &el);
         cairo_set_source_rgb(cr, 0.49, 0.53, 0.58); // #7D8794
         cairo_move_to(cr, x + M.padX, labelBase);
-        cairo_show_text(cr, cols[i].label.c_str());
+        cairo_show_text(cr, c.label.c_str());
 
         // value
         cairo_set_font_size(cr, M.valuePx);
         cairo_text_extents_t ev;
-        cairo_text_extents(cr, cols[i].value.c_str(), &ev);
-        if (cols[i].hot) cairo_set_source_rgb(cr, 1.0, 0.30, 0.29); // red like reference
-        else             cairo_set_source_rgb(cr, 0.93, 0.945, 0.96);
+        cairo_text_extents(cr, c.value.c_str(), &ev);
+        if (c.hot) cairo_set_source_rgb(cr, 1.0, 0.30, 0.29); // red like reference
+        else       cairo_set_source_rgb(cr, 0.93, 0.945, 0.96);
         cairo_move_to(cr, x + M.padX, valueBase);
-        cairo_show_text(cr, cols[i].value.c_str());
+        cairo_show_text(cr, c.value.c_str());
 
-        if (cols[i].hot) { // small underline under hot values (as in the shot)
+        if (c.hot) { // small underline under hot values (as in the shot)
             double uw = std::min(ev.width, 2 * M.padX + 8.0 * g_uiScale);
             cairo_rectangle(cr, x + M.padX, valueBase + 5.0 * g_uiScale, uw,
                             2.0 * g_uiScale);
             cairo_fill(cr);
         }
-
-        x += M.colWidth(cr, cols[i]);
-        if (i + 1 < cols.size()) x += M.gap;
     }
 }
 
@@ -715,6 +920,17 @@ static void render(View& v, const Snapshot& s) {
     M.prepare(mc);
     int w = M.width(mc, cols);
     int h = M.height();
+
+    // remember per-column hit areas; GPU/VRAM columns map back to their index
+    // (column order: CPU RAM SWAP | GPU0..GPU(n-1) | VRAM0..VRAM(n-1))
+    v.colRects = layoutCols(mc, M, cols);
+    size_t ng = s.gpus.size();
+    for (size_t i = 3; i < v.colRects.size() && i - 3 <= 2 * ng; ++i) {
+        long gi = (long)i - 3;
+        if (gi >= 0 && gi < (long)ng)         v.colRects[i].gpu = (int)gi;
+        else if (ng > 0 && gi < 2 * (long)ng) v.colRects[i].gpu = (int)(gi - ng);
+    }
+
     cairo_destroy(mc);
     cairo_surface_destroy(tmp);
 
@@ -962,6 +1178,7 @@ static int createWindow(View& v, Display* dpy) {
     } else {
         v.visual = DefaultVisual(dpy, v.screen);
     }
+    v.depth = depth; // the popup window (created later) needs it too
 
     // scaled placeholder so the pre-resize state is sensible too
     int w0 = (int)(240 * g_uiScale), h0 = (int)(68 * g_uiScale);
@@ -984,6 +1201,9 @@ static int createWindow(View& v, Display* dpy) {
     bg.blue  = (short)(0.078 * 65535);
     XAllocColor(dpy, cmap, &bg);
 
+    v.cmap = cmap;   // the popup window shares it (same visual)
+    v.bgPixel = bg.pixel;
+
     long valuemask = CWOverrideRedirect | CWBackPixel | CWBorderPixel |
                      CWEventMask | CWColormap;
     XSetWindowAttributes attr{};
@@ -991,7 +1211,8 @@ static int createWindow(View& v, Display* dpy) {
     attr.background_pixel  = bg.pixel;
     attr.border_pixel      = BlackPixel(dpy, v.screen);
     attr.colormap          = cmap;
-    attr.event_mask        = ExposureMask | ButtonPressMask | PointerMotionMask;
+    attr.event_mask        = ExposureMask | ButtonPressMask | PointerMotionMask |
+                             LeaveWindowMask; // hide the GPU popup on pointer leave
 
     Window win = XCreateWindow(
         dpy, RootWindow(dpy, v.screen),
@@ -1017,6 +1238,222 @@ static int createWindow(View& v, Display* dpy) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// GPU hover popup: a small always-on-top card with the device name, PCI info
+// and the display connections (DP/HDMI/...) of one GPU.
+// ---------------------------------------------------------------------------
+
+struct PopRow {
+    std::string text;
+    int kind = 0; // 0=title, 1=pci sub-line, 2=connected row, 3=off/dim row
+};
+
+static void popupRows(const GpuInfo& g, std::vector<PopRow>& rows) {
+    rows.push_back({g.name.empty() ? "(unknown GPU)" : g.name, 0});
+
+    if (!g.pciAddr.empty() || !g.pciIds.empty()) {
+        std::string t = "PCI";
+        if (!g.pciAddr.empty()) t += " " + g.pciAddr;
+        if (!g.pciIds.empty())  t += " (" + g.pciIds + ")";
+        rows.push_back({t, 1});
+    }
+
+    if (g.conns.empty()) {
+        rows.push_back({"no display connections", 3});
+        return;
+    }
+
+    // align the name/kind columns of all connector rows (monospace grid)
+    int wN = 0, wK = 0;
+    for (const auto& c : g.conns) {
+        wN = std::max(wN, (int)c.name.size());
+        wK = std::max(wK, (int)c.kind.size());
+    }
+    char buf[160];
+    for (const auto& c : g.conns) {
+        const std::string tail = c.connected ? (!c.mode.empty() ? c.mode
+                                                                : std::string("--"))
+                                             : "off";
+        snprintf(buf, sizeof buf, "%-*s  %-*s  %s",
+                 wN, c.name.c_str(), wK, c.kind.c_str(), tail.c_str());
+        rows.push_back({buf, c.connected ? 2 : 3});
+    }
+}
+
+struct PopGeom {
+    int w = 0, h = 0;
+    double padX = 12;
+    std::vector<double> base; // text baseline of every row
+};
+
+static PopGeom popupGeom(cairo_t* cr, const std::vector<PopRow>& rows) {
+    Metrics M;
+    M.prepare(cr); // applies the UI scale + label/value font metrics
+
+    const double sc   = g_uiScale;
+    const double padX = 12 * sc, pt = 10 * sc, pb = 11 * sc;
+    const double gapT = 9 * sc, gapR = 6 * sc; // after title / between other rows
+
+    PopGeom g;
+    g.padX = padX;
+    double y = pt, maxw = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const bool title = (rows[i].kind == 0);
+        cairo_text_extents_t te;
+        cairo_set_font_size(cr, title ? M.valuePx : M.labelPx);
+        cairo_text_extents(cr, rows[i].text.c_str(), &te);
+        maxw = std::max(maxw, te.width);
+        g.base.push_back(y + (title ? M.ve.ascent : M.le.ascent));
+        y += (title ? M.ve.ascent + M.ve.descent : M.le.ascent + M.le.descent)
+           + ((i + 1 < rows.size()) ? (title ? gapT : gapR) : 0);
+    }
+    g.w = (int)std::ceil(maxw + 2 * padX);
+    g.h = (int)std::ceil(y + pb);
+    return g;
+}
+
+// same dark rounded-card look as the main panel, a touch more opaque since it
+// floats in front of everything
+static void paintPopup(cairo_t* cr, int W, int H, bool argb,
+                       const std::vector<PopRow>& rows) {
+    Metrics M;
+    M.prepare(cr);
+    PopGeom g = popupGeom(cr, rows); // per-row baselines at the current scale
+
+    if (argb) cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    else      cairo_set_source_rgb(cr, 0.043, 0.059, 0.078);
+    cairo_paint(cr);
+
+    const double rad = 9 * g_uiScale;
+    roundRect(cr, 0.5, 0.5, W - 1, H - 1, rad);
+    if (argb) cairo_set_source_rgba(cr, 0.043, 0.059, 0.078, 0.97);
+    else      cairo_set_source_rgb(cr, 0.043, 0.059, 0.078);
+    cairo_fill(cr);
+
+    roundRect(cr, 0.5, 0.5, W - 1, H - 1, rad);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.10); // hairline border
+    cairo_set_line_width(cr, std::max(1.0, 1.0 * g_uiScale));
+    cairo_stroke(cr);
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const bool title = (rows[i].kind == 0);
+        cairo_set_font_size(cr, title ? M.valuePx : M.labelPx);
+        if      (title)             cairo_set_source_rgb(cr, 0.93, 0.945, 0.96); // device name
+        else if (rows[i].kind == 1) cairo_set_source_rgb(cr, 0.49, 0.53, 0.58); // pci info
+        else if (rows[i].kind == 2) cairo_set_source_rgb(cr, 0.76, 0.80, 0.86); // connected
+        else                        cairo_set_source_rgb(cr, 0.40, 0.435, 0.49); // off / dim
+        cairo_move_to(cr, g.padX, g.base[i]);
+        cairo_show_text(cr, rows[i].text.c_str());
+    }
+}
+
+// separate small borderless window for the popup; shares main's visual +
+// colormap. Non-fatal when unavailable -> hovering simply does nothing.
+static void createPopup(View& v) {
+    long valuemask = CWOverrideRedirect | CWBackPixel | CWBorderPixel |
+                     CWEventMask | CWColormap;
+    XSetWindowAttributes attr{};
+    attr.override_redirect = True; // no WM decorations, like the main widget
+    attr.background_pixel  = v.bgPixel;
+    attr.border_pixel      = BlackPixel(v.dpy, v.screen);
+    attr.colormap          = v.cmap;
+    attr.event_mask        = ExposureMask; // repaint on expose
+
+    int w0 = (int)(320 * g_uiScale), h0 = (int)(150 * g_uiScale);
+    Window win = XCreateWindow(v.dpy, v.root, 0, 0, w0, h0, 0, v.depth,
+                               InputOutput, v.visual, valuemask, &attr);
+    if (win == None) {
+        fprintf(stderr, "jtop: failed to create popup window (hover disabled)\n");
+        return;
+    }
+    XStoreName(v.dpy, win, "jtop-gpu-info");
+
+    // stay above regular windows, like the main panel does
+    Atom a_state = XInternAtom(v.dpy, "_NET_WM_STATE", False);
+    Atom a_above = XInternAtom(v.dpy, "_NET_WM_STATE_ABOVE", False);
+    XChangeProperty(v.dpy, win, a_state, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char*)&a_above, 1);
+
+    v.popWin = win;
+    cairo_surface_t* ps = cairo_xlib_surface_create(v.dpy, win, v.visual, w0, h0);
+    if (cairo_surface_status(ps) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "jtop: failed to create popup surface (hover disabled)\n");
+        cairo_surface_destroy(ps);
+        XDestroyWindow(v.dpy, win);
+        v.popWin = None;
+        return;
+    }
+    v.popSurf = ps;
+}
+
+// GPU index under the last pointer position, or -1 (also when over CPU/RAM/...)
+static int hoverGpuIndex(const View& v) {
+    if (v.mx < 0 || v.my < 0 || v.my >= v.winH) return -1;
+    for (const auto& r : v.colRects)
+        if (r.gpu >= 0 && v.mx >= r.x && v.mx < r.x + r.w) return r.gpu;
+    return -1;
+}
+
+static void hidePopup(View& v) {
+    if (!v.popShown || v.popWin == None) { v.popShown = false; return; }
+    XUnmapWindow(v.dpy, v.popWin);
+    v.popShown = false;
+    XFlush(v.dpy);
+}
+
+// (re)build the popup content of the current GPU and position it just below
+// the widget at the hovered column (above when there is no room underneath)
+static void refreshPopup(View& v, const State& s) {
+    if (v.popWin == None || !v.popSurf) return;
+    int g = v.popGpu;
+    if (g < 0 || g >= (int)s.snap.gpus.size()) { hidePopup(v); return; }
+
+    std::vector<PopRow> rows;
+    popupRows(s.snap.gpus[g], rows);
+
+    cairo_surface_t* tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 8, 8);
+    cairo_t* mc = cairo_create(tmp);
+    PopGeom pg = popupGeom(mc, rows);
+    cairo_destroy(mc);
+    cairo_surface_destroy(tmp);
+
+    if (pg.w != v.popW || pg.h != v.popH) {
+        XResizeWindow(v.dpy, v.popWin, pg.w, pg.h);
+        cairo_xlib_surface_set_size(v.popSurf, pg.w, pg.h);
+        v.popW = pg.w;
+        v.popH = pg.h;
+    }
+
+    Window child = None; int wx0 = 0, wy0 = 0;
+    XTranslateCoordinates(v.dpy, v.win, v.root, 0, 0, &wx0, &wy0, &child);
+    double colX = -1; // first rect of this GPU is its "GPU i" column
+    for (const auto& r : v.colRects)
+        if (r.gpu == g) { colX = r.x; break; }
+
+    const int gap = (int)(8 * g_uiScale);
+    int x = wx0 + (int)(colX < 0 ? 0 : colX);
+    int y = wy0 + v.winH + gap;
+    if (y + pg.h > v.rootH - 2 && wy0 - pg.h - gap >= 0) y = wy0 - pg.h - gap; // flip up
+    x = std::max(2, std::min(x, v.rootW - pg.w - 2));
+    y = std::max(2, std::min(y, v.rootH - pg.h - 2));
+    XMoveWindow(v.dpy, v.popWin, x, y);
+
+    cairo_t* cr = cairo_create(v.popSurf);
+    paintPopup(cr, pg.w, pg.h, v.argb, rows);
+    cairo_surface_flush(v.popSurf);
+    cairo_destroy(cr);
+}
+
+static void showPopupAt(View& v, const State& s, int g) {
+    v.popGpu = g;
+    refreshPopup(v, s);
+    if (!v.popShown && v.popWin != None) {
+        XMapWindow(v.dpy, v.popWin);
+        v.popShown = true;
+        XFlush(v.dpy);
+    }
+}
+
 static int runEventLoop(View& v, State& s) {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::milliseconds(5000); // refresh every 5 s
@@ -1033,6 +1470,7 @@ static int runEventLoop(View& v, State& s) {
                 case ButtonPress:
                     if (ev.xbutton.button == 3) return 0; // right click -> quit
                     if (ev.xbutton.button == 1) {
+                        hidePopup(v); // no hover popup while dragging
                         Window child = None;
                         int wx = 0, wy = 0;
                         XTranslateCoordinates(v.dpy, v.win, RootWindow(v.dpy, v.screen),
@@ -1047,15 +1485,22 @@ static int runEventLoop(View& v, State& s) {
                     }
                     break;
 
-                case MotionNotify:
+                case MotionNotify: {
                     if (v.dragging) {
                         int nx = ev.xmotion.x_root - v.dragDX;
                         int ny = ev.xmotion.y_root - v.dragDY;
                         nx = std::max(0, std::min(nx, v.rootW  - v.winW));
                         ny = std::max(0, std::min(ny, v.rootH - v.winH));
                         XMoveWindow(v.dpy, v.win, nx, ny);
+                    } else { // GPU hover -> popup (state change only redraws)
+                        v.mx = ev.xmotion.x;
+                        v.my = ev.xmotion.y;
+                        int g = hoverGpuIndex(v);
+                        if (g < 0) hidePopup(v);
+                        else if (!v.popShown || v.popGpu != g) showPopupAt(v, s, g);
                     }
                     break;
+                }
 
                 case ButtonRelease:
                     if (v.dragging) {
@@ -1064,8 +1509,16 @@ static int runEventLoop(View& v, State& s) {
                     }
                     break;
 
+                case LeaveNotify: // pointer left the widget -> no hover popup
+                    hidePopup(v);
+                    break;
+
                 case Expose:
-                    render(v, s.snap); // full redraw is cheap at this size
+                    if (v.popWin != None && ev.xexpose.window == v.popWin) {
+                        if (v.popShown) refreshPopup(v, s); // repaint popup content
+                    } else {
+                        render(v, s.snap); // full redraw is cheap at this size
+                    }
                     break;
 
                 default:
@@ -1078,6 +1531,7 @@ static int runEventLoop(View& v, State& s) {
         if (now >= nextTick) {
             refresh(s);
             render(v, s.snap);
+            if (v.popShown && !v.dragging) refreshPopup(v, s); // data may have changed
             while (nextTick <= clock::now()) nextTick += period; // resync if we lagged
         } else {
             long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1120,6 +1574,7 @@ int main(int argc, char** argv) {
     View v{};
     int rc = createWindow(v, dpy);
     if (rc != 0) return rc;
+    createPopup(v); // GPU hover popup window (non-fatal when unavailable)
 
     State s{};
     refresh(s);      // initial snapshot (includes a quick CPU baseline sample)
@@ -1129,6 +1584,8 @@ int main(int argc, char** argv) {
 
     runEventLoop(v, s);
 
+    if (v.popSurf) cairo_surface_destroy(v.popSurf);
+    if (v.popWin != None) XDestroyWindow(v.dpy, v.popWin);
     cairo_surface_destroy(v.surf);
     XDestroyWindow(v.dpy, v.win);
     XCloseDisplay(v.dpy);

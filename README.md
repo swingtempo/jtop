@@ -24,6 +24,12 @@ Data refreshes **every 5 seconds** while the app is running. Left-drag moves
 the widget; right-click quits it. It sits in the top-right corner as a
 borderless always-on-top "dock" window (no taskbar entry).
 
+Hovering over any GPU or VRAM column pops up a small card with the device's
+name, PCI address/IDs and its display connections (`DP-1 DisplayPort`,
+`HDMI-A-2 HDMI`, ...) including resolution when connected; moving away hides
+it. Connections come from `/sys/class/drm` on every vendor path (NVIDIA needs
+`nvidia-drm.modeset=1` for that; a headless card shows none).
+
 ## GPU support
 
 | Vendor | Source                                   | util % | VRAM   | temp |
@@ -70,8 +76,15 @@ Example:
 ```
 CPU 4%   RAM 7.2G   SWAP 0.0G   CPU° 51
 GPU0 util=94  vram=6.1G   /23.6G   temp=88°
+      NVIDIA GeForce RTX 3090  pci 0000:01:00.0 (10de:2280)
+      DP-1       DisplayPort  connected  3840x2160@60Hz
 GPU1 util=5   vram=2.5G   /21.9G   temp=57°
+      AMD Radeon RX 7900 XTX  pci 0000:41:00.0 (1002:744c)
+      DP-1       DisplayPort  connected  3840x2160@60Hz
 ```
+
+The indented lines are the same data the hover popup shows (device name, PCI
+identity and per-connector status).
 
 ## DPI / scaling
 
