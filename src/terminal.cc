@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
@@ -149,13 +150,21 @@ static void printGpuTable(const Snapshot& s, bool showConns) {
 }
 
 
-// one full frame: summary line + table (+ hint footer in an interactive terminal)
+// one full frame: summary line + table (+ hint footer in an interactive
+// terminal). The footer carries the local time of this frame, so every 5 s
+// refresh is visible at a glance even when the values happen not to change.
 static void printTableFrame(const Snapshot& s, bool showConns, bool interactive) {
     if (interactive) fputs("\x1b[H\x1b[2J", stdout); // cursor home + clear screen
     puts(summaryLine(s).c_str());
     printGpuTable(s, showConns);
-    if (interactive)
-        puts("jtop: terminal mode - c: toggle connection list   q or Ctrl-C: quit");
+    if (interactive) {
+        char ts[32];
+        std::time_t now = std::time(nullptr);
+        struct tm tmv{};
+        localtime_r(&now, &tmv); // wall clock of the frame's data snapshot
+        strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
+        printf("jtop: terminal mode - c: toggle connection list   q or Ctrl-C: quit    updated %s\n", ts);
+    }
     fflush(stdout);
 }
 
