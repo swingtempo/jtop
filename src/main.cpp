@@ -654,20 +654,33 @@ static int createWindow(View& v) {
         v.visual = DefaultVisual(dpy, v.screen);
     }
 
+    int w0 = 240, h0 = 68;
+
+    // Colormap for the window's OWN visual. Passing CWColormap without a
+    // colormap that matches v.visual makes X reject the CreateWindow with
+    // BadMatch (colormaps must belong to the same visual as their window).
+    Colormap cmap = XCreateColormap(dpy, RootWindow(dpy, v.screen),
+                                    v.visual, AllocNone);
+    if (cmap == None) {
+        fprintf(stderr, "jtop: failed to create colormap\n");
+        XCloseDisplay(dpy);
+        return 1;
+    }
+
     // opaque dark background (shown before first paint / without a compositor)
     XColor bg{};
     bg.red   = (short)(0.043 * 65535);
     bg.green = (short)(0.059 * 65535);
     bg.blue  = (short)(0.078 * 65535);
-    XAllocColor(dpy, DefaultColormap(dpy, v.screen), &bg);
+    XAllocColor(dpy, cmap, &bg);
 
-    int w0 = 240, h0 = 68;
     long valuemask = CWOverrideRedirect | CWBackPixel | CWBorderPixel |
                      CWEventMask | CWColormap;
     XSetWindowAttributes attr{};
     attr.override_redirect = True; // no WM decorations -> true desktop widget
     attr.background_pixel  = bg.pixel;
     attr.border_pixel      = BlackPixel(dpy, v.screen);
+    attr.colormap          = cmap;
     attr.event_mask        = ExposureMask | ButtonPressMask | PointerMotionMask;
 
     Window win = XCreateWindow(
