@@ -24,6 +24,12 @@ Data refreshes **every 5 seconds** while the app is running. Left-drag moves
 the widget; right-click quits it. It sits in the top-right corner as a
 borderless always-on-top "dock" window (no taskbar entry).
 
+Hovering over any GPU or VRAM column pops up a small card with the device's
+name, PCI address/IDs and its display connections (`DP-1 DisplayPort`,
+`HDMI-A-2 HDMI`, ...) including resolution when connected; moving away hides
+it. Connections come from `/sys/class/drm` on every vendor path (NVIDIA needs
+`nvidia-drm.modeset=1` for that; a headless card shows none).
+
 ## GPU support
 
 | Vendor | Source                                   | util % | VRAM   | temp |
@@ -70,7 +76,54 @@ Example:
 ```
 CPU 4%   RAM 7.2G   SWAP 0.0G   CPU° 51
 GPU0 util=94  vram=6.1G   /23.6G   temp=88°
+      NVIDIA GeForce RTX 3090  pci 0000:01:00.0 (10de:2280)
+      DP-1       DisplayPort  connected  3840x2160@60Hz
 GPU1 util=5   vram=2.5G   /21.9G   temp=57°
+      AMD Radeon RX 7900 XTX  pci 0000:41:00.0 (1002:744c)
+      DP-1       DisplayPort  connected  3840x2160@60Hz
+```
+
+The indented lines are the same data the hover popup shows (device name, PCI
+identity and per-connector status).
+
+### `--table`: terminal view + no-display fallback
+
+`--table` renders the data as one concise line per GPU — identity, PCI and
+stats are each shown exactly once (the `CONN` column summarizes display
+collectors as *connected/total*). It is also jtop's **automatic fallback when
+no X display can be opened** (e.g. a plain SSH session): instead of quitting,
+the app prints a note on stderr and runs in terminal mode — nothing to
+remember.
+
+```sh
+./build/jtop --table            # live while attached to a tty
+env -u DISPLAY ./build/jtop     # same thing via the auto-fallback
+```
+
+In an interactive terminal it redraws every 5 s like the GUI. Keys: **c**
+toggles the per-GPU connection detail lines on/off, **q** or Ctrl-C quits (the
+tty is restored either way). When stdout is piped or redirected it prints one
+compact table and exits — handy for logs/tickets/CI; use `--dump` there if you
+want the full machine-readable snapshot incl. per-connector details.
+
+Default view:
+
+```
+CPU 3%   RAM 27.8G   SWAP 1.4G   CPU° 35
+#  DEVICE  PCI                       UTIL           VRAM  TEMP  CONN
+-  ------  ------------------------  ----  -------------  ----  ----
+0  --      0000:0b:00.0 [1002:7551]    0%    57M / 31.9G   32°  0/4
+1  --      0000:06:00.0 [1002:7551]    8%  29.5G / 31.9G   70°  2/4
+```
+
+With connection details shown (after pressing **c**):
+
+```
+0  --      0000:0b:00.0 [1002:7551]    0%    57M / 31.9G   32°  0/4
+      DP-4       DisplayPort  off
+      ...                                            
+1  --      0000:06:00.0 [1002:7551]    8%  29.5G / 31.9G   70°  2/4
+      DP-2       DisplayPort  connected  3840x2160
 ```
 
 ## DPI / scaling
@@ -105,3 +158,6 @@ exactly the original pixel design.
   semi-transparent corners. Without one it's a plain dark rectangle — same data.
 - NVIDIA GPU stats are collected by spawning `nvidia-smi` once per refresh
   (~5 s). If the driver is broken/unloaded the sysfs fallback is used instead.
+- When X cannot be opened at all (plain SSH, headless box), jtop does not exit:
+  it falls back to `--table` terminal mode automatically (one-shot when stdout
+  is not a tty, live 5 s refresh in an interactive terminal).
