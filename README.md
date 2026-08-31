@@ -21,7 +21,7 @@ Hot values turn red with a small underline (GPU util ≥ 90 %, temp ≥ 90 °C,
 VRAM ≥ 95 % full), just like the reference shot.
 
 Data refreshes **every 5 seconds** while the app is running. Left-drag moves
-the widget; right-click quits it. It sits in the bottom-right corner as a
+the widget; right-click quits it. It sits in the top-right corner as a
 borderless always-on-top "dock" window (no taskbar entry).
 
 ## GPU support
@@ -72,6 +72,21 @@ CPU 4%   RAM 7.2G   SWAP 0.0G   CPU° 51
 GPU0 util=94  vram=6.1G   /23.6G   temp=88°
 GPU1 util=5   vram=2.5G   /21.9G   temp=57°
 ```
+
+## DPI / scaling
+
+The widget scales its fonts, paddings and decorations to match the session's
+UI scale. Detection order (first hit wins):
+
+1. `JTOP_SCALE` env var — manual override, e.g. `JTOP_SCALE=2 ./jtop`
+2. `GDK_DPI_X` / `GDK_DPI_Y` (dots per inch; 96 = no scaling)
+3. `GDK_SCALE` integer factor
+4. GNOME settings: `scaling-factor` x `text-scaling-factor`
+   (`org.gnome.desktop.interface`) — i.e. follows the normal display-scale UI setting
+5. Physical screen DPI from X (only honored above ~145 dpi, clamped to 2x)
+
+On a standard unscaled desktop this resolves to 1.0 and the layout is
+exactly the original pixel design.
 
 ## Notes
 

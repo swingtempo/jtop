@@ -416,6 +416,106 @@ static void printDump(const Snapshot& s) {
 }
 
 // ---------------------------------------------------------------------------
+// UI scale (DPI): one factor applied to every layout constant below so that
+// text, padding and decorations all grow together on scaled desktops.
+// Detection order, first hit wins:
+//   1. JTOP_SCALE env var      - manual override, any float > 0
+//   2. GDK_DPI_X / GDK_DPI_Y   - dots per inch, factor = value / 96
+//   3. GDK_SCALE               - integer factor >= 1
+//   4. GNOME settings          - gsettings scaling-factor * text-scaling-factor
+//                                (0 == "auto" -> counts as 1; the whole step is
+//                                 skipped if gsettings is missing or fails)
+//   5. physical X screen DPI   - avg dpi / 96 clamped to [1,2]; returns 1.0 when
+//                                the reported size implies < ~145 dpi so plain
+//                                unscaled desktops are not over-scaled
+// The result is finally clamped to [1.0, 3.0]. Unscaled sessions resolve to
+// exactly 1.0 (pixel-identical to pre-scaling behavior).
+// ---------------------------------------------------------------------------
+
+static double g_uiScale = 1.0; // set once by detectUiScale() in main()
+
+// parse a non-empty env var as double; false when unset/empty/not-a-number
+static bool envToDouble(const char* name, double& out) {
+    const char* s = getenv(name);
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    double v = strtod(s, &end);
+    if (end == s) return false;
+    out = v;
+    return true;
+}
+
+// run `gsettings get <key>` and parse the printed value as a double.
+// Returns false (=> caller skips this source) when gsettings is missing,
+// the key does not exist or nothing numeric can be parsed. Note that some
+// GLib versions prefix the value with its type ("uint32 0").
+static bool gnomeSettingDouble(const char* key, double& out) {
+    std::string cmd = "gsettings get ";
+    cmd += key;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return false;
+    char buf[128];
+    std::string line;
+    if (fgets(buf, sizeof(buf), p)) line = trim(std::string(buf));
+    int rc = pclose(p);
+    if (rc != 0 || line.empty()) return false;
+
+    auto parseTok = [&](const std::string& t) -> bool {
+        char* e = nullptr;
+        double v = strtod(t.c_str(), &e);
+        if (t.empty() || e == t.c_str() || *e != '\0') return false;
+        out = v;
+        return true;
+    };
+    size_t sp = line.find(' ');
+    if (sp != std::string::npos) { // "type value" -> try the value first
+        if (parseTok(trim(line.substr(sp + 1)))) return true;
+        if (parseTok(trim(line.substr(0, sp)))) return true;
+    } else if (parseTok(line)) {
+        return true;
+    }
+    return false;
+}
+
+static double detectUiScale(Display* dpy) {
+    const auto clamp = [](double x) { return std::max(1.0, std::min(x, 3.0)); };
+    double v;
+
+    // 1) manual override (documented in README)
+    if (envToDouble("JTOP_SCALE", v) && v > 0.0) return clamp(v);
+
+    // 2) GDK dots-per-inch env vars (96 dpi == factor 1.0)
+    if (envToDouble("GDK_DPI_X", v) && v > 0.0) return clamp(v / 96.0);
+    if (envToDouble("GDK_DPI_Y", v) && v > 0.0) return clamp(v / 96.0);
+
+    // 3) GDK integer scaling factor
+    const char* gs = getenv("GDK_SCALE");
+    if (gs && *gs) { int f = atoi(gs); if (f >= 1) return clamp((double)f); }
+
+    // 4) GNOME interface settings (both keys must succeed, else fall through)
+    double sf = 0.0, tsf = 0.0;
+    if (gnomeSettingDouble("org.gnome.desktop.interface scaling-factor", sf) &&
+        gnomeSettingDouble("org.gnome.desktop.interface text-scaling-factor", tsf)) {
+        if (sf < 1.0) sf = 1.0; // uint32 0 == "automatic" -> unscaled base
+        return clamp(sf * tsf);
+    }
+
+    // 5) physical screen DPI reported by the X server
+    double dpiX = -1.0, dpiY = -1.0;
+    if (dpy) {
+        int scr = DefaultScreen(dpy);
+        long mmw = DisplayWidthMM(dpy, scr), mmt = DisplayHeightMM(dpy, scr);
+        if (mmw > 0) dpiX = 25.4 * DisplayWidth(dpy, scr) / (double)mmw;
+        if (mmt > 0) dpiY = 25.4 * DisplayHeight(dpy, scr) / (double)mmt;
+    }
+    double avg = -1.0;
+    if (dpiX > 0 && dpiY > 0)      avg = (dpiX + dpiY) / 2.0;
+    else if (dpiX > 0 || dpiY > 0) avg = dpiX > 0 ? dpiX : dpiY;
+    if (avg < 145.0) return 1.0; // unknown or small physical size -> no over-scaling
+    return clamp(std::min(2.0, avg / 96.0));
+}
+
+// ---------------------------------------------------------------------------
 // window / drawing (X11 + cairo)
 // ---------------------------------------------------------------------------
 
@@ -448,6 +548,13 @@ struct Metrics {
     cairo_font_extents_t le{}, ve{}; // font (line) metrics at label / value size
 
     void prepare(cairo_t* cr) {
+        // apply the session UI scale to every layout constant (the font sizes
+        // are set from labelPx/valuePx below, so text scales along with them)
+        labelPx  *= g_uiScale;  valuePx  *= g_uiScale;
+        padX     *= g_uiScale;  gap      *= g_uiScale;
+        outerPad *= g_uiScale;  topPad   *= g_uiScale;
+        botPad   *= g_uiScale;  midGap   *= g_uiScale;
+
         cairo_select_font_face(cr, "DejaVu Sans Mono", CAIRO_FONT_SLANT_NORMAL,
                                CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, labelPx);
@@ -530,14 +637,15 @@ static void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
     }
     cairo_paint(cr);
 
-    roundRect(cr, 0.5, 0.5, W - 1, H - 1, 11.0);
+    const double rad = 11.0 * g_uiScale;   // corner radius scales with the UI
+    roundRect(cr, 0.5, 0.5, W - 1, H - 1, rad);
     if (argb) cairo_set_source_rgba(cr, 0.043, 0.059, 0.078, 0.94);
     else      cairo_set_source_rgb(cr, 0.043, 0.059, 0.078);
     cairo_fill(cr);
 
-    roundRect(cr, 0.5, 0.5, W - 1, H - 1, 11.0);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.08); // hairline border
-    cairo_set_line_width(cr, 1.0);
+    roundRect(cr, 0.5, 0.5, W - 1, H - 1, rad);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.08); // hairline border (>= 1 px)
+    cairo_set_line_width(cr, std::max(1.0, 1.0 * g_uiScale));
     cairo_stroke(cr);
 
     const double labelBase = M.labelBase();
@@ -548,8 +656,9 @@ static void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
         if (i > 0) { // subtle separator in the gap between columns
             double sx = x - M.gap / 2.0 + 0.5;
             cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
-            cairo_move_to(cr, sx, 16);
-            cairo_line_to(cr, sx, H - 16);
+            const double sepIn = 16.0 * g_uiScale; // vertical insets scale too
+            cairo_move_to(cr, sx, sepIn);
+            cairo_line_to(cr, sx, H - sepIn);
             cairo_stroke(cr);
         }
 
@@ -571,8 +680,9 @@ static void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
         cairo_show_text(cr, cols[i].value.c_str());
 
         if (cols[i].hot) { // small underline under hot values (as in the shot)
-            double uw = std::min(ev.width, 2 * M.padX + 8.0);
-            cairo_rectangle(cr, x + M.padX, valueBase + 5.0, uw, 2.0);
+            double uw = std::min(ev.width, 2 * M.padX + 8.0 * g_uiScale);
+            cairo_rectangle(cr, x + M.padX, valueBase + 5.0 * g_uiScale, uw,
+                            2.0 * g_uiScale);
             cairo_fill(cr);
         }
 
@@ -641,7 +751,7 @@ static void setEwmhHints(View& v) {
 struct OutRect { int x, y, w, h; bool primary; };
 
 // Ask the `xrandr` CLI for connected outputs (avoids linking libXrandr).
-// On Mutter/GNOME X11 all monitors form ONE merged root window, so "bottom
+// On Mutter/GNOME X11 all monitors form ONE merged root window, so "top
 // right of the root" can land on a monitor the user isn't even looking at.
 static std::vector<OutRect> monitorRects() {
     static const char* kCmd = "xrandr -q 2>/dev/null";
@@ -670,9 +780,9 @@ static std::vector<OutRect> monitorRects() {
     return out;
 }
 
-// Move the (still unmapped) widget to the bottom-right of the monitor that
+// Move the (still unmapped) widget to the top-right of the monitor that
 // currently holds the pointer, i.e. where the user ran the app and is looking.
-static void placeBottomRight(View& v) {
+static void placeTopRight(View& v) {
     const int margin = 24;
     auto rects = monitorRects();
 
@@ -691,20 +801,19 @@ static void placeBottomRight(View& v) {
 
     int x, y;
     if (mon) {
-        x = mon->x + mon->w - v.winW - margin; // bottom-right corner of that monitor
-        y = mon->y + mon->h - v.winH - margin;
-        // clamp: keep it on the monitor even if the widget is wider than it
+        x = mon->x + mon->w - v.winW - margin; // top-right corner of that monitor
+        y = mon->y + margin;
+        // clamp: keep it on the monitor even if the widget is bigger than it
         x = std::max(mon->x, std::min(x, mon->x + mon->w - v.winW));
         y = std::max(mon->y, std::min(y, mon->y + mon->h - v.winH));
     } else {
-        x = v.rootW - v.winW - margin;
-        y = v.rootH - v.winH - margin;
+        x = v.rootW - v.winW - margin; // top-right of the whole root
+        y = margin;
     }
     XMoveWindow(v.dpy, v.win, x, y);
 }
 
-static int createWindow(View& v) {
-    Display* dpy = XOpenDisplay(nullptr);
+static int createWindow(View& v, Display* dpy) {
     if (!dpy) {
         fprintf(stderr, "jtop: cannot open X display (is DISPLAY set?)\n");
         return 1;
@@ -726,7 +835,8 @@ static int createWindow(View& v) {
         v.visual = DefaultVisual(dpy, v.screen);
     }
 
-    int w0 = 240, h0 = 68;
+    // scaled placeholder so the pre-resize state is sensible too
+    int w0 = (int)(240 * g_uiScale), h0 = (int)(68 * g_uiScale);
 
     // Colormap for the window's OWN visual. Passing CWColormap without a
     // colormap that matches v.visual makes X reject the CreateWindow with
@@ -757,7 +867,7 @@ static int createWindow(View& v) {
 
     Window win = XCreateWindow(
         dpy, RootWindow(dpy, v.screen),
-        v.rootW - w0 - 24, v.rootH - h0 - 24, // bottom-right corner
+        v.rootW - w0 - 24, 24,                // top-right corner (re-placed before map)
         w0, h0, 0, depth, InputOutput, v.visual, valuemask, &attr);
     if (win == None) {
         fprintf(stderr, "jtop: failed to create window\n");
@@ -864,14 +974,22 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    Display* dpy = XOpenDisplay(nullptr);
+    if (!dpy) {
+        fprintf(stderr, "jtop: cannot open X display (is DISPLAY set?)\n");
+        return 1;
+    }
+    // Resolve the session UI scale once, before any window/geometry decision.
+    g_uiScale = detectUiScale(dpy);
+
     View v{};
-    int rc = createWindow(v);
+    int rc = createWindow(v, dpy);
     if (rc != 0) return rc;
 
     State s{};
     refresh(s);      // initial snapshot (includes a quick CPU baseline sample)
     render(v, s.snap);
-    placeBottomRight(v);          // land on the monitor the user is looking at
+    placeTopRight(v);             // land on the monitor the user is looking at
     XMapWindow(v.dpy, v.win);     // paint first, map second -> no background flash
 
     runEventLoop(v, s);
