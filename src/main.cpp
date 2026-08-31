@@ -17,6 +17,10 @@
 //   right mouse button : quit
 //   hover a GPU column : popup with device name, PCI info and display connections
 //   auto refresh       : every 5 seconds while running
+//
+// CLI modes: --dump prints one snapshot to stdout; --table renders a terminal
+// table of the GPU/device/connection data (also used automatically when no X
+// display is available, e.g. over plain SSH).
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -554,13 +558,17 @@ static void refresh(State& s) {
     s.snap = std::move(sn);
 }
 
+// the CPU/RAM/SWAP summary line (shared by --dump and table mode)
+static std::string summaryLine(const Snapshot& s) {
+    auto g = [](int v) -> std::string { return v < 0 ? "--" : std::to_string(v); };
+    const std::string swap = s.hasSwap ? fmtAlwaysGB(s.swapUsedKb) : "n/a";
+    return "CPU " + g(s.cpuPct) + "%   RAM " + fmtSmartKb(s.ramUsedKb) +
+           "   SWAP " + swap + "   CPU\xC2\xB0 " + g(s.cpuTempC);
+}
+
 static void printDump(const Snapshot& s) {
     auto g = [](int v) -> std::string { return v < 0 ? "--" : std::to_string(v); };
-    printf("CPU %s%%   RAM %s   SWAP %s",
-           (s.cpuPct < 0 ? "--" : std::to_string(s.cpuPct)).c_str(),
-           fmtSmartKb(s.ramUsedKb).c_str(),
-           s.hasSwap ? fmtAlwaysGB(s.swapUsedKb).c_str() : "n/a");
-    printf("   CPU° %s\n", g(s.cpuTempC).c_str());
+    puts(summaryLine(s).c_str());
     if (s.gpus.empty()) {
         printf("(no GPUs detected)\n");
         return;
@@ -586,6 +594,114 @@ static void printDump(const Snapshot& s) {
             else
                 printf("      %-10s %-12s %s\n", cn.name.c_str(), cn.kind.c_str(), st);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// terminal table: `--table` mode, and also the automatic fallback when no X
+// display is available (e.g. a plain SSH session). One row per GPU + one of
+// its connectors; column widths are computed from the data itself.
+// ---------------------------------------------------------------------------
+
+// display width: everything we print here is made of single-cell characters,
+// so each UTF-8 lead byte counts as 1 and continuation bytes as 0 (keeps "65°" aligned)
+static size_t dispW(const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+struct TCol { const char* title; bool right = false; };
+
+static void printGpuTable(const Snapshot& s) {
+    static const TCol kCols[] = {
+        {"#", true},      {"DEVICE"},     {"PCI"},         {"VENDOR:ID"},
+        {"UTIL", true},   {"VRAM", true}, {"TEMP", true},
+        {"CONN"},         {"TYPE"},       {"STATUS"},      {"RESOLUTION", true},
+    };
+    constexpr size_t NC = sizeof(kCols) / sizeof(kCols[0]);
+
+    if (s.gpus.empty()) { puts("(no GPUs detected)"); return; }
+
+    std::vector<std::vector<std::string>> rows;
+    for (size_t i = 0; i < s.gpus.size(); ++i) {
+        const auto& gp = s.gpus[i];
+        // the GPU identity + stats are repeated on every connector row so each
+        // line is self-contained (grep/sort/pipe friendly)
+        std::vector<std::string> base{
+            std::to_string(i),
+            gp.name.empty() ? "--" : gp.name,
+            gp.pciAddr.empty() ? "--" : gp.pciAddr,
+            gp.pciIds.empty()  ? "--" : gp.pciIds,
+            (gp.util < 0) ? "--" : (std::to_string(gp.util) + "%"),
+            fmtMiB(gp.vramUsedMiB) + " / " + fmtMiB(gp.vramTotalMiB),
+            (gp.tempC < 0) ? "--" : (std::to_string(gp.tempC) + "\xC2\xB0")};
+
+        if (gp.conns.empty()) {
+            base.push_back("-");
+            base.push_back("-");
+            base.push_back("no connections");
+            base.push_back("--");
+            rows.push_back(std::move(base));
+            continue;
+        }
+        for (const auto& cn : gp.conns) {
+            std::vector<std::string> r = base;
+            r.push_back(cn.name);
+            r.push_back(cn.kind.empty() ? "--" : cn.kind);
+            r.push_back(cn.connected ? "connected" : "disconnected");
+            r.push_back(cn.mode.empty() ? "--" : cn.mode);
+            rows.push_back(std::move(r));
+        }
+    }
+
+    size_t w[NC];
+    for (size_t c = 0; c < NC; ++c) w[c] = std::strlen(kCols[c].title);
+    for (const auto& r : rows)
+        for (size_t c = 0; c < NC && c < r.size(); ++c)
+            w[c] = std::max(w[c], dispW(r[c]));
+
+    const auto line = [&](const std::vector<std::string>& cells) {
+        std::string out;
+        for (size_t c = 0; c < NC && c < cells.size(); ++c) {
+            const size_t dw = dispW(cells[c]);
+            if (!out.empty()) out += "  "; // column gap
+            if (kCols[c].right) out.append(w[c] - dw, ' '); // right-align the numerics
+            out += cells[c];
+            if (!kCols[c].right) out.append(w[c] - dw, ' ');
+        }
+        return out;
+    };
+
+    std::vector<std::string> head;
+    for (size_t c = 0; c < NC; ++c) head.push_back(kCols[c].title);
+    puts(line(head).c_str());
+
+    std::string rule; // separator under the header
+    for (size_t c = 0; c < NC; ++c) {
+        if (!rule.empty()) rule += "  ";
+        rule.append(w[c], '-');
+    }
+    puts(rule.c_str());
+    for (const auto& r : rows) puts(line(r).c_str());
+}
+
+// one-shot table when stdout is not a tty; live re-draw every 5 s (the same
+// period as the GUI) while attached to a terminal. Ctrl-C exits either way.
+static int runTableMode() {
+    State s{};
+    const bool interactive = (isatty(STDOUT_FILENO) == 1);
+
+    for (;;) {
+        refresh(s);
+        if (interactive) fputs("\x1b[H\x1b[2J", stdout); // cursor home + clear screen
+        puts(summaryLine(s.snap).c_str());
+        printGpuTable(s.snap);
+        if (interactive) puts("jtop: terminal mode - Ctrl-C to quit");
+        fflush(stdout);
+        if (!interactive) return 0;
+        const struct timespec ts{5, 0};
+        nanosleep(&ts, nullptr);
     }
 }
 
@@ -1556,10 +1672,16 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // --table: GPU/device/connection info as a terminal table, no X involved
+    if (argc > 1 && std::strcmp(argv[1], "--table") == 0)
+        return runTableMode();
+
     Display* dpy = XOpenDisplay(nullptr);
     if (!dpy) {
-        fprintf(stderr, "jtop: cannot open X display (is DISPLAY set?)\n");
-        return 1;
+        // no graphics available (e.g. a plain SSH session without forwarding):
+        // fall back to the terminal table instead of quitting
+        fprintf(stderr, "jtop: cannot open X display (is DISPLAY set?) -> falling back to terminal table\n");
+        return runTableMode();
     }
     // Which connected output sits under the pointer? Needed before any window
     // exists so monitors.xml's per-monitor scale can be picked for it.

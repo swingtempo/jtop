@@ -86,6 +86,33 @@ GPU1 util=5   vram=2.5G   /21.9G   temp=57°
 The indented lines are the same data the hover popup shows (device name, PCI
 identity and per-connector status).
 
+### `--table`: terminal table + no-display fallback
+
+`--table` renders the same data as an aligned table. It is also jtop's
+**automatic fallback when no X display can be opened** (e.g. a plain SSH
+session): instead of quitting, the app prints a note on stderr and runs in
+terminal mode — nothing to remember.
+
+In an interactive terminal it redraws every 5 s like the GUI (Ctrl-C quits);
+when stdout is piped or redirected it prints one table and exits — handy for
+logs, tickets and CI:
+
+```sh
+./build/jtop --table            # live while attached to a tty
+env -u DISPLAY ./build/jtop     # same thing via the auto-fallback
+```
+
+Sample output (one row per GPU + connector; widths adapt to the data):
+
+```
+CPU 8%   RAM 33.7G   SWAP 1.4G   CPU° 47
+#  DEVICE  PCI           VENDOR:ID  UTIL           VRAM  TEMP  CONN      TYPE         STATUS        RESOLUTION
+-  ------  ------------  ---------  ----  -------------  ----  --------  -----------  ------------  ----------
+0  --      0000:0b:00.0  1002:7551   47%  15.9G / 31.9G   68°  DP-4      DisplayPort  disconnected          --
+...
+1  --      0000:06:00.0  1002:7551   46%  16.2G / 31.9G   94°  HDMI-A-1  HDMI         connected      3840x2160
+```
+
 ## DPI / scaling
 
 The widget scales its fonts, paddings and decorations to match the session's
@@ -118,3 +145,6 @@ exactly the original pixel design.
   semi-transparent corners. Without one it's a plain dark rectangle — same data.
 - NVIDIA GPU stats are collected by spawning `nvidia-smi` once per refresh
   (~5 s). If the driver is broken/unloaded the sysfs fallback is used instead.
+- When X cannot be opened at all (plain SSH, headless box), jtop does not exit:
+  it falls back to `--table` terminal mode automatically (one-shot when stdout
+  is not a tty, live 5 s refresh in an interactive terminal).
