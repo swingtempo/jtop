@@ -19,6 +19,8 @@ struct Col {
     std::string label;  // small grey text on top, e.g. "GPU0"
     std::string value;  // big text below,          e.g. "94%"
     bool hot = false;   // red + underline (as in the reference shot)
+    int group = 0;      // which visual collection this column belongs to
+                        // (0: CPU/RAM/SWAP, 1+i: GPU i + VRAM i)
 };
 
 // x-extent of one column in the last rendered frame; gpu >= 0 marks GPU/VRAM
@@ -31,8 +33,10 @@ struct ColRect {
 // layout metrics (single source of truth for sizing + painting)
 struct Metrics {
     double labelPx = 19, valuePx = 19.0;
-    double padX = 13.0, gap = 22.0, outerPad = 15.0, topPad = 13.0, botPad = 12.5;
+    double padX = 13.0, gap = 22.0, groupGap = 38.0, outerPad = 15.0,
+           topPad = 13.0, botPad = 12.5;
     double midGap = 7.0;
+    double groupPad = 8.0;  // padding between a group's columns and its card
 
     cairo_font_extents_t le{}, ve{}; // font (line) metrics at label / value size
 
@@ -57,7 +61,8 @@ struct Metrics {
     int width(cairo_t* cr, const std::vector<Col>& cols) const {
         int w = (int)std::ceil(2 * outerPad);
         for (const auto& c : cols) w += (int)std::ceil(colWidth(cr, c));
-        if (cols.size() > 1) w += (int)(cols.size() - 1) * gap;
+        for (size_t i = 1; i < cols.size(); ++i)
+            w += (int)(cols[i].group == cols[i - 1].group ? gap : groupGap);
         return w;
     }
 };

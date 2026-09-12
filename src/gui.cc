@@ -189,16 +189,20 @@ std::vector<Col> buildColumns(const Snapshot& s) {
     cols.push_back({"RAM", fmtSmartKb(s.ramUsedKb), false});
     cols.push_back({"SWAP", s.hasSwap ? fmtAlwaysGB(s.swapUsedKb) : "--", false});
 
-    for (size_t i = 0; i < s.gpus.size(); ++i)
-        cols.push_back({"GPU" + std::to_string(i),
-                        (s.gpus[i].util < 0 ? "--" : (std::to_string(s.gpus[i].util) + "% ") + std::to_string(s.gpus[i].tempC) + "\xC2\xB0"),
-                        s.gpus[i].util >= 90 || s.gpus[i].tempC >= 90});
     for (size_t i = 0; i < s.gpus.size(); ++i) {
         const auto& gp = s.gpus[i];
+        Col g{"GPU" + std::to_string(i),
+             (gp.util < 0 ? "--" : (std::to_string(gp.util) + "% " + std::to_string(gp.tempC) + "\xC2\xB0")),
+             gp.util >= 90 || gp.tempC >= 90};
+        g.group = (int)i + 1; // its own card per GPU: GPU i sits next to VRAM i
+        cols.push_back(g);
+
         bool hotVram = false;
         if (gp.vramTotalMiB > 0 && gp.vramUsedMiB >= 0)
             hotVram = (double)gp.vramUsedMiB / gp.vramTotalMiB >= 0.95;
-        cols.push_back({"VRAM" + std::to_string(i), fmtMiB(gp.vramUsedMiB), hotVram});
+        Col r{"VRAM" + std::to_string(i), fmtMiB(gp.vramUsedMiB), hotVram};
+        r.group = g.group;
+        cols.push_back(r);
     }
     return cols;
 }
@@ -213,7 +217,8 @@ std::vector<ColRect> layoutCols(cairo_t* cr, const Metrics& M,
         ColRect r{x, M.colWidth(cr, cols[i]), -1};
         out.push_back(r);
         x += r.w;
-        if (i + 1 < cols.size()) x += M.gap;
+        if (i + 1 < cols.size())
+            x += (cols[i + 1].group == cols[i].group ? M.gap : M.groupGap);
     }
     return out;
 }
@@ -246,9 +251,32 @@ void paintSnapshot(cairo_t* cr, int W, int H, bool argb,
     const double valueBase = M.valueBase();
 
     std::vector<ColRect> rects = layoutCols(cr, M, cols);
+
+    // one subtle rounded "card" behind every group of related columns, so
+    // CPU/RAM/SWAP and each GPU+VRAM pair read as their own little collection
+    int nGroups = 0;
+    for (const auto& c : cols) nGroups = std::max(nGroups, c.group + 1);
+    for (int g = 0; g < nGroups; ++g) {
+        double x0 = 1e18, x1 = -1e18;
+        for (size_t i = 0; i < cols.size(); ++i)
+            if (cols[i].group == g) {
+                x0 = std::min(x0, rects[i].x);
+                x1 = std::max(x1, rects[i].x + rects[i].w);
+            }
+        if (x0 > x1) continue; // empty group
+        const double gp = M.groupPad, gy = 6.0 * g_uiScale;
+        roundRect(cr, x0 - gp, gy, (x1 + gp) - (x0 - gp), H - 2 * gy,
+                  9.0 * g_uiScale);
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.055);
+        cairo_fill(cr);
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.14);
+        cairo_set_line_width(cr, std::max(1.0, 1.0 * g_uiScale));
+        cairo_stroke(cr);
+    }
+
     for (size_t i = 0; i < cols.size(); ++i) {
-        if (i > 0) { // subtle separator in the gap between columns
-            double sx = rects[i].x - M.gap / 2.0 + 0.5;
+        if (i > 0 && cols[i].group != cols[i - 1].group) { // separator between groups
+            double sx = rects[i].x - M.groupGap / 2.0 + 0.5;
             cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
             const double sepIn = 16.0 * g_uiScale; // vertical insets scale too
             cairo_move_to(cr, sx, sepIn);
@@ -297,14 +325,13 @@ static void render(View& v, const Snapshot& s) {
     int w = M.width(mc, cols);
     int h = M.height();
 
-    // remember per-column hit areas; GPU/VRAM columns map back to their index
-    // (column order: CPU RAM SWAP | GPU0..GPU(n-1) | VRAM0..VRAM(n-1))
+    // remember per-column hit areas; GPU and VRAM columns map back to their
+    // index (column order: CPU RAM SWAP | GPU0 VRAM0 | GPU1 VRAM1 | ...)
     v.colRects = layoutCols(mc, M, cols);
     size_t ng = s.gpus.size();
-    for (size_t i = 3; i < v.colRects.size() && i - 3 <= 2 * ng; ++i) {
-        long gi = (long)i - 3;
-        if (gi >= 0 && gi < (long)ng)         v.colRects[i].gpu = (int)gi;
-        else if (ng > 0 && gi < 2 * (long)ng) v.colRects[i].gpu = (int)(gi - ng);
+    for (size_t i = 3; i < v.colRects.size() && i - 3 < 2 * ng; ++i) {
+        long gi = (long)i - 3; // 0=GPU0, 1=VRAM0, 2=GPU1, 3=VRAM1, ...
+        v.colRects[i].gpu = (int)(gi / 2); // both columns of a pair share it
     }
 
     cairo_destroy(mc);
@@ -924,6 +951,7 @@ void Metrics::prepare(cairo_t* cr) {
     padX     *= g_uiScale;  gap      *= g_uiScale;
     outerPad *= g_uiScale;  topPad   *= g_uiScale;
     botPad   *= g_uiScale;  midGap   *= g_uiScale;
+    groupGap *= g_uiScale;  groupPad *= g_uiScale;
 
     cairo_select_font_face(cr, "DejaVu Sans Mono", CAIRO_FONT_SLANT_NORMAL,
                            CAIRO_FONT_WEIGHT_NORMAL);

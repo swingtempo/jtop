@@ -1,7 +1,9 @@
 // jtop - tiny GPU/CPU status widget for Linux (X11)
 //
 // A small borderless desktop window showing, in one compact row:
-//   CPU % | RAM | SWAP | CPU °  |  per-GPU: util %, VRAM used, temp °C
+//   [CPU % | RAM | SWAP]  [GPU0 util% | VRAM0]  [GPU1 util% | VRAM1] ...
+//   (each bracketed block sits on its own subtle card; CPU °C is in the CPU
+//   value, GPU °C in the util value; hover a GPU card for details)
 //
 // Data sources (all local, no network):
 //   * /proc/stat          -> aggregate CPU usage (delta between samples)
