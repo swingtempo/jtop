@@ -512,9 +512,6 @@ static std::vector<DrmCard> readDrmCards() {
         for (auto& card : cards)
             if (card.n == pc.n) { card.conns.push_back(pc.c); break; }
 
-    std::sort(cards.begin(), cards.end(),
-              [](const DrmCard& a, const DrmCard& b) { return a.n < b.n; });
-
     for (auto& c : cards) {
         std::string dev = c.path + "/device";
         char real[PATH_MAX]; // glibc's FORTIFY wrapper requires a PATH_MAX-sized buffer
@@ -535,6 +532,20 @@ static std::vector<DrmCard> readDrmCards() {
             c.label = pciIdName(v, d);
         }
     }
+    // Order by canonical PCI address (BDF) so jtop's GPU0/GPU1/... labels
+    // match lspci / rocm-smi / nvidia-smi (PCI enumeration order). The drm
+    // cardN number reflects driver probe order, which can differ (e.g.
+    // card0 = 0b:00.0 while card1 = 06:00.0, the card driving the displays
+    // that every other tool lists as device 0). Cards without a PCI address
+    // (virtual, ...) go last, by card number.
+    std::stable_sort(cards.begin(), cards.end(),
+              [](const DrmCard& a, const DrmCard& b) {
+                  if (a.pciAddr.empty() != b.pciAddr.empty())
+                      return !a.pciAddr.empty();
+                  if (!a.pciAddr.empty() && a.pciAddr != b.pciAddr)
+                      return a.pciAddr < b.pciAddr; // fixed-width zero-padded
+                  return a.n < b.n;
+              });
     for (auto& c : cards)
         std::sort(c.conns.begin(), c.conns.end(),
                   [](const GpuConn& a, const GpuConn& b) { return a.name < b.name; });
