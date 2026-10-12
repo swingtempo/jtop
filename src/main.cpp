@@ -23,6 +23,8 @@
 // CLI modes: --dump prints one full snapshot to stdout; --table shows compact
 // per-GPU lines in the terminal (connection list toggled with 'c'; also used
 // automatically when no X display is available, e.g. over plain SSH).
+// --console / -c forces that same terminal view even when an X display is
+// available (useful inside a terminal on a desktop session).
 //
 // Source layout: this file only parses arguments and dispatches between the
 // three modules below; system.{h,cc} reads the machine, terminal.{h,cc} renders
@@ -47,6 +49,11 @@ int main(int argc, char** argv) {
 
     // --table: GPU/device/connection info as a terminal table, no X involved
     if (argc > 1 && std::strcmp(argv[1], "--table") == 0)
+        return runTableMode();
+
+    // --console / -c: force the terminal table even when X is available
+    if (argc > 1 && (std::strcmp(argv[1], "--console") == 0 ||
+                     std::strcmp(argv[1], "-c") == 0))
         return runTableMode();
 
     int rc = runWidget();

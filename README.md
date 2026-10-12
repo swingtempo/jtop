@@ -83,7 +83,7 @@ g++ -O2 src/main.cpp src/system.cc src/terminal.cc src/gui.cc \
 
 | File                  | Role |
 |-----------------------|------|
-| `src/main.cpp`        | argument parsing + mode dispatch (`--dump`, `--table`, widget, no-display fallback) |
+| `src/main.cpp`        | argument parsing + mode dispatch (`--dump`, `--table`, `--console`/`-c`, widget, no-display fallback) |
 | `src/system.{h,cc}`   | all `/proc`, sysfs and nvidia-smi/rocm-smi reads that produce the `Snapshot`; no X11 or output code |
 | `src/terminal.{h,cc}` | text presentation: the `--dump` snapshot and the live table view (also the fallback) |
 | `src/gui.{h,cc}`      | the X11 widget: windows, DPI scale detection, cairo painting of the row + GPU hover popup, event loop |
@@ -121,10 +121,14 @@ PCIe shows `-` when the kernel doesn't report a link (virtual or non-PCIe
 devices). It is also jtop's **automatic fallback when
 no X display can be opened** (e.g. a plain SSH session): instead of quitting,
 the app prints a note on stderr and runs in terminal mode — nothing to
-remember.
+remember. `--console` (or `-c`) forces this terminal view even when an X
+display *is* available, so you can run jtop inside a desktop terminal without
+opening the widget.
 
 ```sh
 ./build/jtop --table            # live while attached to a tty
+./build/jtop --console          # force terminal mode, X or not
+./build/jtop -c                 # same, short form
 env -u DISPLAY ./build/jtop     # same thing via the auto-fallback
 ```
 
